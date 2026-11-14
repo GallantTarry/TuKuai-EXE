@@ -26,7 +26,7 @@ bucket_name = "tukuai-exe-temp"
 
 [[kv_namespaces]]
 binding = "JOBS_KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "8acb065f15f747df9104dd5e23236ae1"
 
 [triggers]
 crons = ["*/15 * * * *"]
