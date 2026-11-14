@@ -40,14 +40,14 @@ async function writeR2FromRequest<T>(
   writer: (payload: ReadableStream | ArrayBuffer) => Promise<T>
 ): Promise<T> {
   if (!request.body) {
-    throw new BodyLimitError(400, '请求体为空，未收到上传数据');
+    throw new BodyLimitError(400, 'Empty request body: no upload payload received.');
   }
 
   const lenHeader = request.headers.get('content-length');
   if (lenHeader !== null) {
     const declaredLen = Number(lenHeader);
     if (!Number.isInteger(declaredLen) || declaredLen <= 0 || declaredLen > maxBytes) {
-      throw new BodyLimitError(413, '上传数据块大小超出允许范围');
+      throw new BodyLimitError(413, 'Upload chunk exceeds allowed size limit.');
     }
     try {
       return await writer(request.body);
@@ -55,7 +55,7 @@ async function writeR2FromRequest<T>(
       if (err instanceof TypeError && !request.bodyUsed) {
         const buf = await request.arrayBuffer();
         if (buf.byteLength <= 0 || buf.byteLength > maxBytes) {
-          throw new BodyLimitError(413, '上传数据块大小超出允许范围');
+          throw new BodyLimitError(413, 'Upload chunk exceeds allowed size limit.');
         }
         return await writer(buf);
       }
@@ -65,7 +65,7 @@ async function writeR2FromRequest<T>(
 
   const buf = await request.arrayBuffer();
   if (buf.byteLength <= 0 || buf.byteLength > maxBytes) {
-    throw new BodyLimitError(413, '上传数据块大小超出允许范围');
+    throw new BodyLimitError(413, 'Upload chunk exceeds allowed size limit.');
   }
   return await writer(buf);
 }
@@ -152,7 +152,7 @@ async function checkAndBumpQuotas(
     return {
       ok: false,
       status: 429,
-      message: '今日免费云端打包名额已满，请明日再试。',
+      message: 'Daily free build quota reached. Please try again tomorrow.',
     };
   }
 
@@ -161,7 +161,7 @@ async function checkAndBumpQuotas(
     return {
       ok: false,
       status: 429,
-      message: `每小时最多提交 ${ipCap} 次打包请求，请稍后再试。`,
+      message: `Rate limit exceeded: max ${ipCap} builds per hour per IP. Please try again later.`,
     };
   }
 
@@ -293,7 +293,7 @@ async function syncFallbackFromGithubRun(env: Env, job: JobRecord): Promise<JobR
     }
   } else if (runData.conclusion) {
     job.status = 'failed';
-    job.errorMessage = `云端编译未成功 (${runData.conclusion})`;
+    job.errorMessage = `Cloud build failed (${runData.conclusion})`;
     if (!job.r2Deleted) {
       await env.BUCKET.delete(job.r2Key);
       job.r2Deleted = true;
@@ -319,7 +319,7 @@ async function handleCreateJob(
   try {
     payload = (await request.json()) as Record<string, unknown>;
   } catch {
-    return jsonResponse({ error: 'BAD_JSON', message: '请求体格式错误' }, 400, corsOrigin);
+    return jsonResponse({ error: 'BAD_JSON', message: 'Invalid JSON request body.' }, 400, corsOrigin);
   }
 
   const maxPkgBytes = parsePositiveInt(env.MAX_PACKAGE_BYTES, 1024 * 1024 * 1024);
@@ -330,7 +330,7 @@ async function handleCreateJob(
     return jsonResponse(
       {
         error: 'SIZE_LIMIT',
-        message: `压缩包大小需在 1 B ~ ${Math.round(maxPkgBytes / 1024 / 1024)} MB 之间`,
+        message: `Archive size must be between 1 B and ${Math.round(maxPkgBytes / 1024 / 1024)} MB.`,
       },
       400,
       corsOrigin
@@ -347,7 +347,7 @@ async function handleCreateJob(
   const turnstileOk = await verifyTurnstile(env.TURNSTILE_SECRET_KEY, turnstileToken, clientIp);
   if (!turnstileOk) {
     return jsonResponse(
-      { error: 'TURNSTILE_FAILED', message: '人机验证未通过，请刷新验证后重试' },
+      { error: 'TURNSTILE_FAILED', message: 'Human verification failed. Please refresh and try again.' },
       403,
       corsOrigin
     );
@@ -358,7 +358,7 @@ async function handleCreateJob(
     return jsonResponse(
       {
         error: 'QUEUE_FULL',
-        message: '当前云端中转队列已满，请等待 1~2 分钟后重试',
+        message: 'Cloud staging queue is currently full. Please retry in 1-2 minutes.',
         committedBytes,
         maxBucketBytes,
       },
@@ -446,13 +446,13 @@ async function authorizeAwaitingUpload(
   if (!job || !secret || !safeEqual(secret, job.jobSecret)) {
     return {
       ok: false,
-      response: jsonResponse({ error: 'NOT_FOUND', message: '任务不存在或凭证无效' }, 404, corsOrigin),
+      response: jsonResponse({ error: 'NOT_FOUND', message: 'Job not found or invalid credentials.' }, 404, corsOrigin),
     };
   }
   if (job.status !== 'awaiting_upload') {
     return {
       ok: false,
-      response: jsonResponse({ error: 'INVALID_STATE', message: '当前任务状态不允许上传' }, 409, corsOrigin),
+      response: jsonResponse({ error: 'INVALID_STATE', message: 'Current job state does not allow uploads.' }, 409, corsOrigin),
     };
   }
   return { ok: true, job };
@@ -471,7 +471,7 @@ async function handleDirectUpload(
 
   const { job } = auth;
   if (job.uploadMode && job.uploadMode !== 'single') {
-    return jsonResponse({ error: 'UPLOAD_MODE_MISMATCH', message: '该任务需分片上传' }, 400, corsOrigin);
+    return jsonResponse({ error: 'UPLOAD_MODE_MISMATCH', message: 'This job requires multipart upload.' }, 400, corsOrigin);
   }
 
   const maxPkgBytes = parsePositiveInt(env.MAX_PACKAGE_BYTES, 1024 * 1024 * 1024);
@@ -488,7 +488,7 @@ async function handleDirectUpload(
     if (err instanceof BodyLimitError) {
       return jsonResponse({ error: 'UPLOAD_REJECTED', message: err.message }, err.status, corsOrigin);
     }
-    return jsonResponse({ error: 'UPLOAD_FAILED', message: '写入临时存储失败，请重试' }, 502, corsOrigin);
+    return jsonResponse({ error: 'UPLOAD_FAILED', message: 'Failed to write temporary storage. Please retry.' }, 502, corsOrigin);
   }
 }
 
@@ -506,13 +506,13 @@ async function handleUploadPart(
 
   const { job } = auth;
   if (job.uploadMode !== 'multipart' || !job.uploadId) {
-    return jsonResponse({ error: 'UPLOAD_MODE_MISMATCH', message: '任务未启用分片上传' }, 400, corsOrigin);
+    return jsonResponse({ error: 'UPLOAD_MODE_MISMATCH', message: 'Multipart upload is not enabled for this job.' }, 400, corsOrigin);
   }
 
   const expectedParts = job.expectedParts || 1;
   const partNumber = Number(partNumberRaw);
   if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > expectedParts) {
-    return jsonResponse({ error: 'INVALID_PART', message: '无效的分片编号' }, 400, corsOrigin);
+    return jsonResponse({ error: 'INVALID_PART', message: 'Invalid upload part number.' }, 400, corsOrigin);
   }
 
   const maxPartBytes = job.partSize || UPLOAD_PART_BYTES;
@@ -531,7 +531,7 @@ async function handleUploadPart(
     if (err instanceof BodyLimitError) {
       return jsonResponse({ error: 'UPLOAD_REJECTED', message: err.message }, err.status, corsOrigin);
     }
-    return jsonResponse({ error: 'PART_UPLOAD_FAILED', message: '分片写入失败，正在重试' }, 502, corsOrigin);
+    return jsonResponse({ error: 'PART_UPLOAD_FAILED', message: 'Part upload failed, retrying…' }, 502, corsOrigin);
   }
 }
 
@@ -545,12 +545,12 @@ async function handleStartJob(
   try {
     body = (await request.json()) as { secret?: string; parts?: unknown };
   } catch {
-    return jsonResponse({ error: 'BAD_JSON', message: '请求格式错误' }, 400, corsOrigin);
+    return jsonResponse({ error: 'BAD_JSON', message: 'Invalid JSON request format.' }, 400, corsOrigin);
   }
 
   const job = await getJob(env, jobId);
   if (!job || !body.secret || !safeEqual(body.secret, job.jobSecret)) {
-    return jsonResponse({ error: 'NOT_FOUND', message: '任务不存在或凭证无效' }, 404, corsOrigin);
+    return jsonResponse({ error: 'NOT_FOUND', message: 'Job not found or invalid credentials.' }, 404, corsOrigin);
   }
 
   if (job.status !== 'awaiting_upload') {
@@ -573,7 +573,7 @@ async function handleStartJob(
       ]);
       job.r2Deleted = true;
       job.status = 'failed';
-      job.errorMessage = '云端合并上传分片失败，请重新上传';
+      job.errorMessage = 'Failed to assemble multipart upload. Please re-upload.';
       await putJob(env, job);
       return jsonResponse({ error: 'MULTIPART_COMPLETE_FAILED', message: job.errorMessage }, 400, corsOrigin);
     }
@@ -586,7 +586,7 @@ async function handleStartJob(
 
   if (!head || head.size <= 0) {
     return jsonResponse(
-      { error: 'UPLOAD_MISSING', message: '未检测到上传文件，请重新上传' },
+      { error: 'UPLOAD_MISSING', message: 'Uploaded archive not found. Please upload again.' },
       400,
       corsOrigin
     );
@@ -597,7 +597,7 @@ async function handleStartJob(
     await env.BUCKET.delete(job.r2Key);
     job.r2Deleted = true;
     job.status = 'rejected';
-    job.errorMessage = '实际上传文件超出允许体积上限，已被自动清理';
+    job.errorMessage = 'Uploaded archive exceeds allowed size limit and was deleted.';
     await putJob(env, job);
     return jsonResponse({ error: 'SIZE_MISMATCH', message: job.errorMessage }, 400, corsOrigin);
   }
@@ -614,9 +614,9 @@ async function handleStartJob(
     await env.BUCKET.delete(job.r2Key);
     job.r2Deleted = true;
     job.status = 'failed';
-    job.errorMessage = err instanceof Error ? err.message : '触发云端编译失败';
+    job.errorMessage = err instanceof Error ? err.message : 'Failed to dispatch cloud build.';
     await putJob(env, job);
-    return jsonResponse({ error: 'DISPATCH_FAILED', message: '触发云端编译失败' }, 502, corsOrigin);
+    return jsonResponse({ error: 'DISPATCH_FAILED', message: 'Failed to dispatch cloud build.' }, 502, corsOrigin);
   }
 }
 
@@ -629,7 +629,7 @@ async function handleGetJobStatus(
   const secret = url.searchParams.get('secret') || '';
   const job = await getJob(env, jobId);
   if (!job || !secret || !safeEqual(secret, job.jobSecret)) {
-    return jsonResponse({ error: 'NOT_FOUND', message: '任务不存在或凭证无效' }, 404, corsOrigin);
+    return jsonResponse({ error: 'NOT_FOUND', message: 'Job not found or invalid credentials.' }, 404, corsOrigin);
   }
 
   const latest = await syncFallbackFromGithubRun(env, job);
@@ -700,7 +700,7 @@ async function serveGithubArtifactDownload(
   const location = ghRes.headers.get('location');
   if (ghRes.status < 300 || ghRes.status >= 400 || !location) {
     return jsonResponse(
-      { error: 'ARTIFACT_UNAVAILABLE', message: '安装包直链已过期或不存在' },
+      { error: 'ARTIFACT_UNAVAILABLE', message: 'Installer artifact link expired or not found.' },
       410,
       corsOrigin
     );
@@ -711,7 +711,7 @@ async function serveGithubArtifactDownload(
     await probeRes.body?.cancel();
     if (!probeRes.ok && probeRes.status !== 206) {
       return jsonResponse(
-        { error: 'ARTIFACT_FETCH_FAILED', message: '探测安装包大小失败，请稍后重试' },
+        { error: 'ARTIFACT_FETCH_FAILED', message: 'Failed to probe artifact size. Please retry.' },
         502,
         corsOrigin
       );
@@ -738,7 +738,7 @@ async function serveGithubArtifactDownload(
     const validStart = startParam === null || /^\d+$/.test(startParam);
     const validEnd = endParam === null || /^\d+$/.test(endParam);
     if (!validStart || !validEnd) {
-      return jsonResponse({ error: 'INVALID_RANGE', message: '分片参数无效' }, 400, corsOrigin);
+      return jsonResponse({ error: 'INVALID_RANGE', message: 'Invalid chunk range parameters.' }, 400, corsOrigin);
     }
     const startVal = startParam ?? '0';
     const endVal = endParam ?? '';
@@ -759,7 +759,7 @@ async function serveGithubArtifactDownload(
   });
   if (!upstreamRes.ok && upstreamRes.status !== 206) {
     return jsonResponse(
-      { error: 'ARTIFACT_FETCH_FAILED', message: '拉取安装包成品失败，请稍后重试' },
+      { error: 'ARTIFACT_FETCH_FAILED', message: 'Failed to fetch installer artifact. Please retry.' },
       502,
       corsOrigin
     );
@@ -791,12 +791,12 @@ async function handleDownloadArtifact(
   const secret = url.searchParams.get('secret') || '';
   let job = await getJob(env, jobId);
   if (!job || !secret || !safeEqual(secret, job.jobSecret)) {
-    return jsonResponse({ error: 'NOT_FOUND', message: '任务不存在或凭证无效' }, 404, corsOrigin);
+    return jsonResponse({ error: 'NOT_FOUND', message: 'Job not found or invalid credentials.' }, 404, corsOrigin);
   }
 
   job = await syncFallbackFromGithubRun(env, job);
   if (job.status !== 'succeeded' || !job.artifactId) {
-    return jsonResponse({ error: 'NOT_READY', message: '安装包尚未生成完成' }, 409, corsOrigin);
+    return jsonResponse({ error: 'NOT_READY', message: 'Installer build is not ready yet.' }, 409, corsOrigin);
   }
 
   const downloadFileName = resolveDownloadZipFileName(job.artifactName, job.metadata?.appName || '');
@@ -892,7 +892,7 @@ async function handleInternalComplete(request: Request, env: Env, jobId: string)
         : deriveExpectedArtifactName(job.metadata?.appName || '');
   } else {
     job.status = 'failed';
-    job.errorMessage = payload.errorMessage || '云端编译失败，请检查包结构后重试';
+    job.errorMessage = payload.errorMessage || 'Cloud compilation failed. Please check your folder structure and try again.';
   }
 
   await putJob(env, job);

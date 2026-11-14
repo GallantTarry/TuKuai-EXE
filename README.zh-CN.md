@@ -2,7 +2,7 @@
 
 # TuKuai-EXE
 
-面向 **TuKuai Studio** 的 Windows x64 安装包云端封装系统：用户在浏览器中拖入已构建好的桌面应用目录，由 GitHub Actions 在云端自动编译标准 `Setup.exe` 安装包，并通过 **GitHub Actions 原生 Artifact 通道** 返回单一 `.zip` 下载入口；**不支持中国大陆直连，国内使用需开启代理**。
+面向 **TuKuai Studio** 的 Windows x64 安装包云端封装系统：用户在浏览器中拖入已构建好的桌面应用目录，由 GitHub Actions 在云端自动编译标准 `Setup.exe` 安装包，并通过 **GitHub Actions 原生 Artifact 通道** 返回单一 `.zip` 下载入口；**若您所在的地区不支持直接访问，请开启代理（仅提供单一原生入口，不设区域分流备用链接）**。
 
 ---
 
@@ -19,7 +19,7 @@ flowchart TD
     end
 
     subgraph CF["2. Cloudflare 边缘控制与临时中转层"]
-        W["Cloudflare Worker 网关 (仅海外或代理可稳连)"]
+        W["Cloudflare Worker 网关 (受限地区需开启代理)"]
         KV[("Workers KV (任务状态 / 限流 / 预约账本)")]
         R2_IN[("Cloudflare R2 (uploads/ 输入包临时中转)")]
         CRON["Cron 定时清理 (每 15 分钟)"]
@@ -56,7 +56,7 @@ flowchart TD
 | **3. 调度与源码即焚** | Worker → GitHub Actions (`windows-2022`) | GitHub REST API (`workflow_dispatch`)、WebCrypto 原生 `AWS SigV4` 预签名、`/claim` 与 `/downloaded` 隔离机制 | 仅以随机 UUID `job_id` 触发构建（公开日志无敏感信息）；Runner 凭 `RUNNER_AUTH_SECRET` 向 `/claim` 领取 600 秒有效源码下载链接，拉取完成后立即回调 `/downloaded` 删除 R2 临时输入包 |
 | **4. 云端安全编译** | Runner 工作目录 → Windows x64 安装包 | PowerShell 防 Zip Slip 解压、编码识别与 **UTF-16 LE BOM + CRLF** 转码、确定性 GUID、Inno Setup 6 (`ISCC.exe`) | 严检 `appName`/`appVersion`/`mainExe` 防注入与路径穿越；自动识别 UTF-8/UTF-16/GB18030 的 `license.txt` 并转码消除中文乱码；派生稳定 `AppId` 并调用 `ISCC.exe` 以 `lzma2/normal` 编译 `TuKuai-Setup-<slug>-x64.exe` |
 | **5. 原生成品归档** | Runner → GitHub Actions Artifact | `actions/upload-artifact@v4`（`retention-days: 1`）、`/complete` 回调 + Run 状态兜底同步 | 将生成的 `.exe` 直接上传至 GitHub 原生 Artifact（不经过任何 R2 存储桶中转或缓存），携带 `artifactId` 与规范文件名回调 `/complete` 入库，若回调丢失则由 `/runs/{id}/artifacts` 自动兜底同步 |
-| **6. 单一通道下载与巡检** | GitHub Artifact → Worker 代理 → 浏览器 `Blob` | GitHub `/artifacts/{id}/zip` 302 解析、Query `?meta=1` 探针与 `?start=&end=` Range 转发、心跳超时重连、15 分钟 Cron 清理 | 仅保留**单一“下载安装包 (.zip)”按钮**（无国内备用链接）：前端先查 `?meta=1` 获字节总长，再按 `2 MiB x 2` 并发（`25s` 心跳超时、最多重试 `5` 次、抖动时自动降为单路）请求 Worker 实时透传 GitHub 206 分片并附规范 `Content-Disposition`，拼装 `.zip` 保存；Cron 每 15 分钟清理 R2 超 30 分钟残留临时对象 |
+| **6. 单一通道下载与巡检** | GitHub Artifact → Worker 代理 → 浏览器 `Blob` | GitHub `/artifacts/{id}/zip` 302 解析、Query `?meta=1` 探针与 `?start=&end=` Range 转发、心跳超时重连、15 分钟 Cron 清理 | 仅保留**单一“下载安装包 (.zip)”按钮**（无区域分流备用链接）：前端先查 `?meta=1` 获字节总长，再按 `2 MiB x 2` 并发（`25s` 心跳超时、最多重试 `5` 次、抖动时自动降为单路）请求 Worker 实时透传 GitHub 206 分片并附规范 `Content-Disposition`，拼装 `.zip` 保存；Cron 每 15 分钟清理 R2 超 30 分钟残留临时对象 |
 
 ---
 

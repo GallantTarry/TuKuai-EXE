@@ -14,24 +14,30 @@ export function isValidUuid(id: string): boolean {
  */
 export function validateBuildMetadata(raw: unknown): { ok: true; value: BuildMetadata } | { ok: false; error: string } {
   if (!raw || typeof raw !== 'object') {
-    return { ok: false, error: '请求体缺少应用配置信息' };
+    return { ok: false, error: 'Missing application configuration in request body.' };
   }
   const obj = raw as Record<string, unknown>;
 
   const appName = typeof obj.appName === 'string' ? obj.appName.trim() : '';
   if (!appName || appName.length > 80 || FORBIDDEN_TEXT_RE.test(appName)) {
-    return { ok: false, error: '应用名称不能为空、超过 80 字或包含非法字符' };
+    return {
+      ok: false,
+      error: 'Application name must be 1-80 characters and cannot contain forbidden control or INI characters.',
+    };
   }
 
   const appVersion = typeof obj.appVersion === 'string' ? obj.appVersion.trim() : '';
   if (!VERSION_RE.test(appVersion)) {
-    return { ok: false, error: '版本号格式不正确，请使用如 1.0.0 的纯数字版本' };
+    return { ok: false, error: 'Invalid version format. Use numeric dot format such as 1.0.0.' };
   }
 
   const rawPublisher = typeof obj.appPublisher === 'string' ? obj.appPublisher.trim() : '';
   const appPublisher = rawPublisher || 'TuKuai Studio User';
   if (appPublisher.length > 80 || FORBIDDEN_TEXT_RE.test(appPublisher)) {
-    return { ok: false, error: '发布者名称过长或包含非法字符' };
+    return {
+      ok: false,
+      error: 'Publisher name must be at most 80 characters and cannot contain forbidden characters.',
+    };
   }
 
   const rawMainExe = typeof obj.mainExe === 'string' ? obj.mainExe.trim() : '';
@@ -43,7 +49,7 @@ export function validateBuildMetadata(raw: unknown): { ok: true; value: BuildMet
     /(^|\\)\.\.(\\|$)/.test(mainExe) ||
     /[\r\n\x00-\x1F"`;\[\]{}$%]/.test(mainExe)
   ) {
-    return { ok: false, error: '主程序入口必须选择包内有效的 .exe 相对路径' };
+    return { ok: false, error: 'Main executable must be a valid relative .exe path inside the archive.' };
   }
 
   return {
@@ -96,13 +102,13 @@ export function validateUploadedParts(
   expectedParts: number
 ): { ok: true; parts: Array<{ partNumber: number; etag: string }> } | { ok: false; error: string } {
   if (!Array.isArray(rawParts) || rawParts.length !== expectedParts || expectedParts <= 0) {
-    return { ok: false, error: `分片列表不完整，预期 ${expectedParts} 片` };
+    return { ok: false, error: `Incomplete part list: expected ${expectedParts} parts.` };
   }
 
   const byPart = new Map<number, string>();
   for (const item of rawParts) {
     if (!item || typeof item !== 'object') {
-      return { ok: false, error: '分片记录格式错误' };
+      return { ok: false, error: 'Invalid part record format.' };
     }
     const obj = item as Record<string, unknown>;
     const partNumber = Number(obj.partNumber);
@@ -114,16 +120,16 @@ export function validateUploadedParts(
       !etag ||
       etag.length > 128
     ) {
-      return { ok: false, error: '分片编号或校验标识无效' };
+      return { ok: false, error: 'Invalid part number or ETag.' };
     }
     if (byPart.has(partNumber)) {
-      return { ok: false, error: `分片编号重复: ${partNumber}` };
+      return { ok: false, error: `Duplicate part number: ${partNumber}.` };
     }
     byPart.set(partNumber, etag);
   }
 
   if (byPart.size !== expectedParts) {
-    return { ok: false, error: '存在缺失的上传分片' };
+    return { ok: false, error: 'Missing uploaded part(s).' };
   }
 
   const sorted: Array<{ partNumber: number; etag: string }> = [];

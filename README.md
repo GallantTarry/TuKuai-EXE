@@ -2,7 +2,7 @@ English | [简体中文](README.zh-CN.md)
 
 # TuKuai-EXE
 
-A cloud Windows x64 installer packaging system for **TuKuai Studio**: users drop a built desktop application folder in the browser, GitHub Actions compiles a standard `Setup.exe` installer on demand, and returns a single `.zip` download link natively via **GitHub Actions Artifacts**. **Direct access from mainland China is not supported (proxy required; no domestic backup link).**
+A cloud Windows x64 installer packaging system for **TuKuai Studio**: users drop a built desktop application folder in the browser, GitHub Actions compiles a standard `Setup.exe` installer on demand, and returns a single `.zip` download link natively via **GitHub Actions Artifacts**. **If direct access is not supported in your region, please enable a proxy (single native link, no regional mirrors).**
 
 ---
 
@@ -19,7 +19,7 @@ flowchart TD
     end
 
     subgraph CF["2. Cloudflare Edge Gateway and Transient Relay"]
-        W["Cloudflare Worker Gateway (Overseas or Proxy Required)"]
+        W["Cloudflare Worker Gateway (Enable Proxy if Restricted)"]
         KV[("Workers KV (Job State / Quotas / Reservations)")]
         R2_IN[("Cloudflare R2 (uploads/ Transient Input Relay)")]
         CRON["Cron Cleanup (Every 15 Minutes)"]
@@ -56,7 +56,7 @@ flowchart TD
 | **3. Dispatch & Burn-on-Read** | Worker -> GitHub Actions (`windows-2022`) | GitHub REST API (`workflow_dispatch`), WebCrypto `AWS SigV4` presigner, `/claim` + `/downloaded` isolation | Triggers public runners with only an opaque UUID `job_id` (no sensitive metadata in workflow logs); runner exchanges `RUNNER_AUTH_SECRET` at `/claim` for a 600-second SigV4 `GET` URL and invokes `/downloaded` right after download to delete the R2 source archive immediately |
 | **4. Hardened Cloud Compile** | Runner Workspace -> Windows x64 Setup `.exe` | PowerShell safe unzip (Zip Slip & 3 GiB zip-bomb guard), encoding detection + **UTF-16 LE BOM + CRLF** transcoding, deterministic GUID, Inno Setup 6 (`ISCC.exe`) | Sanitizes `appName`/`appVersion`/`mainExe` against path traversal and INI injection; detects UTF-8/UTF-16/GB18030 `license.txt` and normalizes to UTF-16 LE BOM to prevent mojibake; derives a deterministic `AppId` and compiles `TuKuai-Setup-<slug>-x64.exe` with `lzma2/normal` |
 | **5. Native Artifact Archiving** | Runner -> GitHub Actions Artifact | `actions/upload-artifact@v4` (`retention-days: 1`), `/complete` callback + workflow run fallback sync | Uploads the compiled `.exe` directly as a native GitHub Actions Artifact with no R2 artifact staging or cache; notifies `/complete` with `artifactId` and sanitized file name, backed by `/runs/{id}/artifacts` fallback sync |
-| **6. Single-Link Proxy & Sweep** | GitHub Artifact -> Worker Proxy -> Browser `Blob` | GitHub `/artifacts/{id}/zip` 302 resolution, `?meta=1` probe, `?start=&end=` HTTP `206` forwarding, heartbeat retries, 15-min Cron | Exposes a **single "Download Installer (.zip)" button** (no domestic fallback link): browser queries `?meta=1` for byte size, streams `2 MiB x 2` chunks (`25s` idle timeout, up to `5` retries with automatic single-stream step-down) while the Worker refreshes short-lived GitHub URLs and sets clean `Content-Disposition`; 15-min Cron deletes any stale R2 objects older than 30 min |
+| **6. Single-Link Proxy & Sweep** | GitHub Artifact -> Worker Proxy -> Browser `Blob` | GitHub `/artifacts/{id}/zip` 302 resolution, `?meta=1` probe, `?start=&end=` HTTP `206` forwarding, heartbeat retries, 15-min Cron | Exposes a **single "Download Installer (.zip)" button** (no regional mirrors): browser queries `?meta=1` for byte size, streams `2 MiB x 2` chunks (`25s` idle timeout, up to `5` retries with automatic single-stream step-down) while the Worker refreshes short-lived GitHub URLs and sets clean `Content-Disposition`; 15-min Cron deletes any stale R2 objects older than 30 min |
 
 ---
 
