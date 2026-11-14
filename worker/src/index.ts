@@ -1,10 +1,13 @@
 import { presignR2Url } from './sigv4.ts';
 import type { Env, JobRecord, MultipartTrackerRecord, ReservationRecord } from './types.ts';
 import {
+  deriveExpectedArtifactName,
   isValidUuid,
+  parseByteRange,
   parsePositiveInt,
   resolveAllowedOrigin,
   safeEqual,
+  shouldExpireR2Object,
   validateBuildMetadata,
   validateUploadedParts,
 } from './validation.ts';
@@ -16,7 +19,11 @@ const RESERVATION_TTL_SEC = 360;
 const MPU_TTL_SEC = 3600;
 const JOB_TTL_SEC = 86400;
 const ORPHAN_MAX_AGE_MS = 30 * 60 * 1000;
+const ARTIFACT_MAX_AGE_MS = 60 * 60 * 1000;
 const PUT_CONTENT_TYPE = 'application/octet-stream';
+const ARTIFACT_ZIP_CONTENT_TYPE = 'application/zip';
+const EXPOSED_DOWNLOAD_HEADERS =
+  'content-length, content-range, accept-ranges, content-disposition, x-artifact-source';
 // 8 MiB satisfies R2's 5 MiB minimum part rule while staying well under Cloudflare Free's 100 MB limit.
 const UPLOAD_PART_BYTES = 8 * 1024 * 1024;
 
@@ -89,8 +96,8 @@ function handleCorsPreflight(corsOrigin: string | null): Response {
     status: 204,
     headers: {
       'access-control-allow-origin': corsOrigin,
-      'access-control-allow-methods': 'GET, POST, PUT, OPTIONS',
-      'access-control-allow-headers': 'content-type',
+      'access-control-allow-methods': 'GET, HEAD, POST, PUT, OPTIONS',
+      'access-control-allow-headers': 'content-type, range, if-range',
       'access-control-max-age': '86400',
       'vary': 'Origin',
     },
@@ -267,6 +274,22 @@ async function syncFallbackFromGithubRun(env: Env, job: JobRecord): Promise<JobR
   if (runData.status !== 'completed') return job;
 
   if (runData.conclusion === 'success') {
+    const cleanName =
+      job.artifactName && !/^installer-[0-9a-f-]{36}$/i.test(job.artifactName)
+        ? job.artifactName
+        : deriveExpectedArtifactName(job.metadata?.appName || '');
+
+    const expectedR2Key = `artifacts/${job.id}.zip`;
+    const r2Head = await env.BUCKET.head(expectedR2Key);
+    if (r2Head && r2Head.size > 0) {
+      job.status = 'succeeded';
+      job.artifactR2Key = expectedR2Key;
+      job.artifactSize = r2Head.size;
+      job.artifactName = cleanName;
+      await putJob(env, job);
+      return job;
+    }
+
     const artUrl = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/runs/${job.runId}/artifacts`;
     const artRes = await fetch(artUrl, { headers: githubHeaders(env.GITHUB_PAT) });
     if (artRes.ok) {
@@ -277,7 +300,7 @@ async function syncFallbackFromGithubRun(env: Env, job: JobRecord): Promise<JobR
       if (valid) {
         job.status = 'succeeded';
         job.artifactId = String(valid.id);
-        job.artifactName = valid.name;
+        job.artifactName = cleanName;
         await putJob(env, job);
       }
     }
@@ -629,6 +652,8 @@ async function handleGetJobStatus(
       status: latest.status,
       r2Deleted: latest.r2Deleted,
       artifactName: latest.artifactName,
+      artifactSize: latest.artifactSize,
+      hasR2Artifact: Boolean(latest.artifactR2Key),
       errorMessage: latest.errorMessage,
       updatedAt: latest.updatedAt,
     },
@@ -637,25 +662,119 @@ async function handleGetJobStatus(
   );
 }
 
-async function handleDownloadArtifact(
+function resolveDownloadZipFileName(artifactName: string | undefined, appName: string): string {
+  const safeInput =
+    artifactName && !/^installer-[0-9a-f-]{36}$/i.test(artifactName)
+      ? artifactName
+      : deriveExpectedArtifactName(appName);
+  const baseName =
+    safeInput
+      .replace(/\.exe$/i, '')
+      .replace(/\.zip$/i, '')
+      .replace(/["\\\r\n]/g, '_') || 'TuKuai-Setup-x64';
+  return `${baseName}.zip`;
+}
+
+function buildDownloadHeaders(
+  downloadFileName: string,
+  contentType: string,
+  source: 'r2' | 'github',
+  corsOrigin: string | null
+): Headers {
+  const asciiName = downloadFileName.replace(/[^\x20-\x7E]/g, '_') || 'TuKuai-Setup-x64.zip';
+  const headers = new Headers();
+  headers.set('content-type', contentType);
+  headers.set('cache-control', 'no-store');
+  headers.set('accept-ranges', 'bytes');
+  headers.set('x-artifact-source', source);
+  headers.set(
+    'content-disposition',
+    `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(downloadFileName)}`
+  );
+  if (corsOrigin) {
+    headers.set('access-control-allow-origin', corsOrigin);
+    headers.set('access-control-expose-headers', EXPOSED_DOWNLOAD_HEADERS);
+    headers.set('vary', 'Origin');
+  }
+  return headers;
+}
+
+async function serveR2ArtifactDownload(
   request: Request,
   url: URL,
   env: Env,
-  jobId: string,
+  r2Key: string,
+  r2Head: R2Object,
+  downloadFileName: string,
   corsOrigin: string | null
 ): Promise<Response> {
-  const secret = url.searchParams.get('secret') || '';
-  let job = await getJob(env, jobId);
-  if (!job || !secret || !safeEqual(secret, job.jobSecret)) {
-    return jsonResponse({ error: 'NOT_FOUND', message: '任务不存在或凭证无效' }, 404, corsOrigin);
+  const totalSize = r2Head.size;
+  if (url.searchParams.get('meta') === '1') {
+    return jsonResponse(
+      {
+        ok: true,
+        fileName: downloadFileName,
+        size: totalSize,
+        source: 'r2',
+        expiresAt: r2Head.uploaded.getTime() + ARTIFACT_MAX_AGE_MS,
+      },
+      200,
+      corsOrigin
+    );
   }
 
-  job = await syncFallbackFromGithubRun(env, job);
-  if (job.status !== 'succeeded' || !job.artifactId) {
-    return jsonResponse({ error: 'NOT_READY', message: '安装包尚未生成完成' }, 409, corsOrigin);
+  const parsedRange = parseByteRange(
+    url.searchParams.get('start'),
+    url.searchParams.get('end'),
+    request.headers.get('range'),
+    totalSize
+  );
+  if (!parsedRange.ok) {
+    return new Response(null, {
+      status: parsedRange.status,
+      headers: {
+        'content-range': `bytes */${totalSize}`,
+        ...(corsOrigin ? { 'access-control-allow-origin': corsOrigin, vary: 'Origin' } : {}),
+      },
+    });
   }
 
-  const ghArtifactZipUrl = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/artifacts/${job.artifactId}/zip`;
+  const headers = buildDownloadHeaders(downloadFileName, ARTIFACT_ZIP_CONTENT_TYPE, 'r2', corsOrigin);
+  headers.set('content-length', String(parsedRange.length));
+  if (!parsedRange.full) {
+    headers.set('content-range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
+  }
+  const status = parsedRange.full ? 200 : 206;
+
+  if (request.method === 'HEAD') {
+    return new Response(null, { status, headers });
+  }
+
+  const obj = parsedRange.full
+    ? await env.BUCKET.get(r2Key)
+    : await env.BUCKET.get(r2Key, {
+        range: { offset: parsedRange.start, length: parsedRange.length },
+      });
+  if (!obj || !obj.body) {
+    return jsonResponse(
+      { error: 'ARTIFACT_UNAVAILABLE', message: 'R2 临时缓存已被清理或不存在' },
+      410,
+      corsOrigin
+    );
+  }
+
+  return new Response(obj.body, { status, headers });
+}
+
+async function serveGithubArtifactDownload(
+  request: Request,
+  url: URL,
+  env: Env,
+  artifactId: string,
+  downloadFileName: string,
+  corsOrigin: string | null
+): Promise<Response> {
+  const ghArtifactZipUrl = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/artifacts/${artifactId}/zip`;
   const ghRes = await fetch(ghArtifactZipUrl, {
     headers: githubHeaders(env.GITHUB_PAT),
     redirect: 'manual',
@@ -666,6 +785,31 @@ async function handleDownloadArtifact(
     return jsonResponse(
       { error: 'ARTIFACT_UNAVAILABLE', message: '安装包直链已过期或不存在' },
       410,
+      corsOrigin
+    );
+  }
+
+  if (url.searchParams.get('meta') === '1') {
+    const probeRes = await fetch(location, { headers: { range: 'bytes=0-0' } });
+    await probeRes.body?.cancel();
+    if (!probeRes.ok && probeRes.status !== 206) {
+      return jsonResponse(
+        { error: 'ARTIFACT_FETCH_FAILED', message: '探测安装包大小失败，请稍后重试' },
+        502,
+        corsOrigin
+      );
+    }
+    const cr = probeRes.headers.get('content-range') || '';
+    const match = /\/(\d+)$/.exec(cr);
+    const totalSize = match ? Number(match[1]) : Number(probeRes.headers.get('content-length') || '0');
+    return jsonResponse(
+      {
+        ok: true,
+        fileName: downloadFileName,
+        size: Number.isFinite(totalSize) && totalSize > 0 ? totalSize : 0,
+        source: 'github',
+      },
+      200,
       corsOrigin
     );
   }
@@ -682,12 +826,31 @@ async function handleDownloadArtifact(
   }
 
   const upstreamHeaders: Record<string, string> = {};
-  const range = request.headers.get('range');
-  const ifRange = request.headers.get('if-range');
-  if (range) upstreamHeaders['range'] = range;
-  if (ifRange) upstreamHeaders['if-range'] = ifRange;
+  const startParam = url.searchParams.get('start');
+  const endParam = url.searchParams.get('end');
+  if (startParam !== null || endParam !== null) {
+    const validStart = startParam === null || /^\d+$/.test(startParam);
+    const validEnd = endParam === null || /^\d+$/.test(endParam);
+    if (!validStart || !validEnd) {
+      return jsonResponse({ error: 'INVALID_RANGE', message: '分片参数无效' }, 400, corsOrigin);
+    }
+    const startVal = startParam ?? '0';
+    const endVal = endParam ?? '';
+    if (endVal !== '' && Number(endVal) < Number(startVal)) {
+      return new Response(null, { status: 416 });
+    }
+    upstreamHeaders['range'] = `bytes=${startVal}-${endVal}`;
+  } else {
+    const range = request.headers.get('range');
+    const ifRange = request.headers.get('if-range');
+    if (range) upstreamHeaders['range'] = range;
+    if (ifRange) upstreamHeaders['if-range'] = ifRange;
+  }
 
-  const upstreamRes = await fetch(location, { headers: upstreamHeaders });
+  const upstreamRes = await fetch(location, {
+    method: request.method === 'HEAD' ? 'HEAD' : 'GET',
+    headers: upstreamHeaders,
+  });
   if (!upstreamRes.ok && upstreamRes.status !== 206) {
     return jsonResponse(
       { error: 'ARTIFACT_FETCH_FAILED', message: '拉取安装包成品失败，请稍后重试' },
@@ -696,33 +859,64 @@ async function handleDownloadArtifact(
     );
   }
 
-  const baseName = (job.artifactName || 'TuKuai-Setup-x64')
-    .replace(/\.exe$/i, '')
-    .replace(/\.zip$/i, '')
-    .replace(/["\\\r\n]/g, '_') || 'TuKuai-Setup-x64';
-  const downloadFileName = `${baseName}.zip`;
-  const asciiName = downloadFileName.replace(/[^\x20-\x7E]/g, '_') || 'TuKuai-Setup-x64.zip';
-
-  const resHeaders = new Headers();
-  resHeaders.set('content-type', upstreamRes.headers.get('content-type') || 'application/zip');
-  resHeaders.set('cache-control', 'no-store');
-  resHeaders.set(
-    'content-disposition',
-    `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(downloadFileName)}`
+  const resHeaders = buildDownloadHeaders(
+    downloadFileName,
+    upstreamRes.headers.get('content-type') || ARTIFACT_ZIP_CONTENT_TYPE,
+    'github',
+    corsOrigin
   );
-  for (const h of ['content-length', 'content-range', 'accept-ranges', 'etag']) {
+  for (const h of ['content-length', 'content-range', 'etag']) {
     const val = upstreamRes.headers.get(h);
     if (val) resHeaders.set(h, val);
   }
-  if (corsOrigin) {
-    resHeaders.set('access-control-allow-origin', corsOrigin);
-    resHeaders.set('vary', 'Origin');
-  }
 
-  return new Response(upstreamRes.body, {
+  return new Response(request.method === 'HEAD' ? null : upstreamRes.body, {
     status: upstreamRes.status,
     headers: resHeaders,
   });
+}
+
+async function handleDownloadArtifact(
+  request: Request,
+  url: URL,
+  env: Env,
+  jobId: string,
+  corsOrigin: string | null
+): Promise<Response> {
+  const secret = url.searchParams.get('secret') || '';
+  let job = await getJob(env, jobId);
+  if (!job || !secret || !safeEqual(secret, job.jobSecret)) {
+    return jsonResponse({ error: 'NOT_FOUND', message: '任务不存在或凭证无效' }, 404, corsOrigin);
+  }
+
+  job = await syncFallbackFromGithubRun(env, job);
+  if (job.status !== 'succeeded' || (!job.artifactR2Key && !job.artifactId)) {
+    return jsonResponse({ error: 'NOT_READY', message: '安装包尚未生成完成' }, 409, corsOrigin);
+  }
+
+  const downloadFileName = resolveDownloadZipFileName(job.artifactName, job.metadata?.appName || '');
+  const r2Key = job.artifactR2Key || `artifacts/${job.id}.zip`;
+  const r2Head = await env.BUCKET.head(r2Key);
+  if (r2Head && r2Head.size > 0) {
+    return serveR2ArtifactDownload(request, url, env, r2Key, r2Head, downloadFileName, corsOrigin);
+  }
+
+  if (job.artifactId) {
+    return serveGithubArtifactDownload(
+      request,
+      url,
+      env,
+      job.artifactId,
+      downloadFileName,
+      corsOrigin
+    );
+  }
+
+  return jsonResponse(
+    { error: 'ARTIFACT_UNAVAILABLE', message: '安装包临时缓存已过期，请重新封装构建' },
+    410,
+    corsOrigin
+  );
 }
 
 async function handleInternalClaim(request: Request, env: Env, jobId: string): Promise<Response> {
@@ -734,21 +928,35 @@ async function handleInternalClaim(request: Request, env: Env, jobId: string): P
     return jsonResponse({ error: 'INVALID_STATE' }, 409);
   }
 
-  const downloadUrl = await presignR2Url({
-    method: 'GET',
-    accountId: env.R2_ACCOUNT_ID,
-    bucket: env.R2_BUCKET_NAME,
-    key: job.r2Key,
-    accessKeyId: env.R2_ACCESS_KEY_ID,
-    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-    expiresSeconds: 600,
-  });
+  const artifactR2Key = `artifacts/${jobId}.zip`;
+  const [downloadUrl, artifactUploadUrl] = await Promise.all([
+    presignR2Url({
+      method: 'GET',
+      accountId: env.R2_ACCOUNT_ID,
+      bucket: env.R2_BUCKET_NAME,
+      key: job.r2Key,
+      accessKeyId: env.R2_ACCESS_KEY_ID,
+      secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+      expiresSeconds: 600,
+    }),
+    presignR2Url({
+      method: 'PUT',
+      accountId: env.R2_ACCOUNT_ID,
+      bucket: env.R2_BUCKET_NAME,
+      key: artifactR2Key,
+      accessKeyId: env.R2_ACCESS_KEY_ID,
+      secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+      expiresSeconds: 1800,
+      contentType: ARTIFACT_ZIP_CONTENT_TYPE,
+    }),
+  ]);
 
   job.status = 'building';
   await putJob(env, job);
 
   return jsonResponse({
     downloadUrl,
+    artifactUploadUrl,
     metadata: job.metadata,
   });
 }
@@ -785,6 +993,7 @@ async function handleInternalComplete(request: Request, env: Env, jobId: string)
   const payload = (await request.json()) as {
     ok?: boolean;
     runId?: string;
+    artifactUploaded?: boolean;
     artifactId?: string;
     artifactName?: string;
     errorMessage?: string;
@@ -796,28 +1005,53 @@ async function handleInternalComplete(request: Request, env: Env, jobId: string)
   }
 
   if (payload.runId) job.runId = String(payload.runId);
-  if (payload.ok && payload.artifactId) {
+  const expectedArtifactKey = `artifacts/${jobId}.zip`;
+  const verifiedR2Head = payload.artifactUploaded
+    ? await env.BUCKET.head(expectedArtifactKey)
+    : null;
+  const hasVerifiedR2 = Boolean(verifiedR2Head && verifiedR2Head.size > 0);
+  const hasGithubArtifact = Boolean(payload.artifactId);
+
+  if (payload.ok && (hasVerifiedR2 || hasGithubArtifact)) {
     job.status = 'succeeded';
-    job.artifactId = String(payload.artifactId);
-    job.artifactName = payload.artifactName || 'TuKuai-Setup-x64.exe';
+    if (hasVerifiedR2 && verifiedR2Head) {
+      job.artifactR2Key = expectedArtifactKey;
+      job.artifactSize = verifiedR2Head.size;
+    }
+    if (hasGithubArtifact) {
+      job.artifactId = String(payload.artifactId);
+    }
+    job.artifactName =
+      payload.artifactName && !/^installer-[0-9a-f-]{36}$/i.test(payload.artifactName)
+        ? payload.artifactName
+        : deriveExpectedArtifactName(job.metadata?.appName || '');
   } else {
     job.status = 'failed';
     job.errorMessage = payload.errorMessage || '云端编译失败，请检查包结构后重试';
   }
 
   await putJob(env, job);
-  return jsonResponse({ updated: true });
+  return jsonResponse({ updated: true, hasR2Artifact: hasVerifiedR2 });
 }
 
 async function cleanupOrphanR2Objects(env: Env): Promise<number> {
-  const cutoff = Date.now() - ORPHAN_MAX_AGE_MS;
+  const now = Date.now();
+  const mpuCutoff = now - ORPHAN_MAX_AGE_MS;
   let deletedCount = 0;
   let cursor: string | undefined;
 
   do {
     const listed = await env.BUCKET.list({ cursor, limit: 1000 });
     const expiredKeys = listed.objects
-      .filter((obj) => obj.uploaded.getTime() < cutoff)
+      .filter((obj) =>
+        shouldExpireR2Object(
+          obj.key,
+          obj.uploaded.getTime(),
+          now,
+          ORPHAN_MAX_AGE_MS,
+          ARTIFACT_MAX_AGE_MS
+        )
+      )
       .map((obj) => obj.key);
 
     if (expiredKeys.length > 0) {
@@ -838,7 +1072,7 @@ async function cleanupOrphanR2Objects(env: Env): Promise<number> {
       }))
     );
     for (const { key, rec } of records) {
-      if (!rec || rec.createdAt < cutoff) {
+      if (!rec || rec.createdAt < mpuCutoff) {
         if (rec?.r2Key && rec?.uploadId) {
           try {
             await env.BUCKET.resumeMultipartUpload(rec.r2Key, rec.uploadId).abort();
@@ -891,7 +1125,7 @@ export default {
       if (action === 'start' && request.method === 'POST') {
         return handleStartJob(request, env, jobId, corsOrigin);
       }
-      if (action === 'download' && request.method === 'GET') {
+      if (action === 'download' && (request.method === 'GET' || request.method === 'HEAD')) {
         return handleDownloadArtifact(request, url, env, jobId, corsOrigin);
       }
     }

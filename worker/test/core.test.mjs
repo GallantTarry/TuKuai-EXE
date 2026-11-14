@@ -2,9 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { presignR2Url } from '../src/sigv4.ts';
 import {
+  deriveExpectedArtifactName,
   isValidUuid,
+  parseByteRange,
   resolveAllowedOrigin,
   safeEqual,
+  shouldExpireR2Object,
   validateBuildMetadata,
   validateUploadedParts,
 } from '../src/validation.ts';
@@ -119,4 +122,61 @@ test('validateUploadedParts validates completeness and sorts parts ascending', (
     false
   );
   assert.equal(validateUploadedParts([{ partNumber: 3, etag: '"e3"' }], 1).ok, false);
+});
+
+test('deriveExpectedArtifactName mirrors build-installer slug logic', () => {
+  assert.equal(deriveExpectedArtifactName('TuKuai Test App'), 'TuKuai-Setup-TuKuai-Test-App-x64.zip');
+  assert.equal(deriveExpectedArtifactName('土块测试工具'), 'TuKuai-Setup-App-x64.zip');
+  assert.equal(deriveExpectedArtifactName('My_App-2026'), 'TuKuai-Setup-My_App-2026-x64.zip');
+});
+
+test('parseByteRange supports query chunks and HTTP Range headers safely', () => {
+  assert.deepEqual(parseByteRange('0', '4194303', null, 10_000_000), {
+    ok: true,
+    full: false,
+    start: 0,
+    end: 4194303,
+    length: 4194304,
+  });
+  assert.deepEqual(parseByteRange('800', '1500', null, 1000), {
+    ok: true,
+    full: false,
+    start: 800,
+    end: 999,
+    length: 200,
+  });
+  assert.deepEqual(parseByteRange(null, null, 'bytes=10-29', 100), {
+    ok: true,
+    full: false,
+    start: 10,
+    end: 29,
+    length: 20,
+  });
+  assert.deepEqual(parseByteRange(null, null, 'bytes=-25', 100), {
+    ok: true,
+    full: false,
+    start: 75,
+    end: 99,
+    length: 25,
+  });
+  assert.deepEqual(parseByteRange(null, null, null, 100), {
+    ok: true,
+    full: true,
+    start: 0,
+    end: 99,
+    length: 100,
+  });
+  assert.deepEqual(parseByteRange('100', '200', null, 100), { ok: false, status: 416 });
+  assert.deepEqual(parseByteRange('-1', '10', null, 100), { ok: false, status: 400 });
+});
+
+test('shouldExpireR2Object applies 30m TTL for uploads and 1h TTL for artifacts', () => {
+  const now = 10_000_000;
+  const uploadMax = 30 * 60 * 1000;
+  const artifactMax = 60 * 60 * 1000;
+
+  assert.equal(shouldExpireR2Object('uploads/job-1.zip', now - 31 * 60 * 1000, now, uploadMax, artifactMax), true);
+  assert.equal(shouldExpireR2Object('uploads/job-1.zip', now - 20 * 60 * 1000, now, uploadMax, artifactMax), false);
+  assert.equal(shouldExpireR2Object('artifacts/job-1.zip', now - 45 * 60 * 1000, now, uploadMax, artifactMax), false);
+  assert.equal(shouldExpireR2Object('artifacts/job-1.zip', now - 61 * 60 * 1000, now, uploadMax, artifactMax), true);
 });

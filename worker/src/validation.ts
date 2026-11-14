@@ -132,3 +132,96 @@ export function validateUploadedParts(
   }
   return { ok: true, parts: sorted };
 }
+
+/**
+ * Mirrors scripts/build-installer.ps1 slug rules so fallback paths never fall back
+ * to internal artifact labels like "installer-<uuid>".
+ */
+export function deriveExpectedArtifactName(appName: string): string {
+  let slug = (appName || '').replace(/[^A-Za-z0-9_-]/g, '-').replace(/^-+|-+$/g, '');
+  if (!slug) slug = 'App';
+  if (slug.length > 40) slug = slug.slice(0, 40);
+  return `TuKuai-Setup-${slug}-x64.zip`;
+}
+
+export type ParsedByteRange =
+  | { ok: true; full: boolean; start: number; end: number; length: number }
+  | { ok: false; status: 400 | 416 };
+
+/**
+ * Parses either query-string chunk offsets (?start=&end=) or standard HTTP Range
+ * headers so browser chunked fetch() stays CORS-safelisted while native managers work too.
+ */
+export function parseByteRange(
+  startParam: string | null,
+  endParam: string | null,
+  rangeHeader: string | null,
+  totalSize: number
+): ParsedByteRange {
+  if (!Number.isInteger(totalSize) || totalSize <= 0) {
+    return { ok: false, status: 416 };
+  }
+
+  if (startParam !== null || endParam !== null) {
+    if (startParam !== null && !/^\d+$/.test(startParam)) {
+      return { ok: false, status: 400 };
+    }
+    if (endParam !== null && !/^\d+$/.test(endParam)) {
+      return { ok: false, status: 400 };
+    }
+    const start = startParam !== null ? Number(startParam) : 0;
+    const rawEnd = endParam !== null ? Number(endParam) : totalSize - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(rawEnd) || start < 0) {
+      return { ok: false, status: 400 };
+    }
+    if (start >= totalSize || rawEnd < start) {
+      return { ok: false, status: 416 };
+    }
+    const end = Math.min(rawEnd, totalSize - 1);
+    return { ok: true, full: false, start, end, length: end - start + 1 };
+  }
+
+  if (rangeHeader) {
+    const trimmed = rangeHeader.trim();
+    const match = /^bytes=(\d*)-(\d*)$/i.exec(trimmed);
+    if (!match) {
+      return { ok: true, full: true, start: 0, end: totalSize - 1, length: totalSize };
+    }
+    const [, rawStart, rawEnd] = match;
+    if (!rawStart && !rawEnd) {
+      return { ok: false, status: 416 };
+    }
+    if (!rawStart) {
+      const suffix = Number(rawEnd);
+      if (!Number.isSafeInteger(suffix) || suffix <= 0) {
+        return { ok: false, status: 416 };
+      }
+      const start = Math.max(0, totalSize - suffix);
+      const end = totalSize - 1;
+      return { ok: true, full: false, start, end, length: end - start + 1 };
+    }
+    const start = Number(rawStart);
+    const parsedEnd = rawEnd ? Number(rawEnd) : totalSize - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(parsedEnd)) {
+      return { ok: false, status: 416 };
+    }
+    if (start >= totalSize || parsedEnd < start) {
+      return { ok: false, status: 416 };
+    }
+    const end = Math.min(parsedEnd, totalSize - 1);
+    return { ok: true, full: false, start, end, length: end - start + 1 };
+  }
+
+  return { ok: true, full: true, start: 0, end: totalSize - 1, length: totalSize };
+}
+
+export function shouldExpireR2Object(
+  key: string,
+  uploadedMs: number,
+  nowMs: number,
+  uploadMaxAgeMs: number,
+  artifactMaxAgeMs: number
+): boolean {
+  const maxAge = key.startsWith('artifacts/') ? artifactMaxAgeMs : uploadMaxAgeMs;
+  return uploadedMs < nowMs - maxAge;
+}
