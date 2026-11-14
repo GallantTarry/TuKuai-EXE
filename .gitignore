@@ -1,0 +1,10 @@
+node_modules/
+.wrangler/
+.dev.vars
+.idea/
+dist/
+*.log
+*.pfx
+*.p12
+.DS_Store
+Thumbs.db

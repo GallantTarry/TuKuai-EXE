@@ -1,0 +1,32 @@
+name = "tukuai-exe-worker"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+workers_dev = true
+
+[assets]
+directory = "../web"
+binding = "ASSETS"
+
+[vars]
+R2_ACCOUNT_ID = "82cb7d7b7d8f5f9b2247a4326dd0f162"
+R2_BUCKET_NAME = "tukuai-exe-temp"
+GITHUB_OWNER = "GallantTarry"
+GITHUB_REPO = "TuKuai-EXE"
+GITHUB_WORKFLOW_FILE = "build-installer.yml"
+GITHUB_REF = "main"
+ALLOWED_ORIGINS = "https://xn--2esp7m.xn--udsye.art,http://localhost:8787,http://127.0.0.1:8787"
+MAX_PACKAGE_BYTES = "1073741824"
+MAX_BUCKET_BYTES = "4294967296"
+DAILY_JOB_CAP = "120"
+IP_HOURLY_CAP = "5"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "tukuai-exe-temp"
+
+[[kv_namespaces]]
+binding = "JOBS_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+[triggers]
+crons = ["*/15 * * * *"]
