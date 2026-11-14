@@ -12,7 +12,7 @@ flowchart TD
         U1["拖入应用目录与可选 license.txt"]
         U2["fflate.browser.js 本地选择性打包 (<= 1 GiB)"]
         U3["8 MiB x 3 并发简单 POST 分片上传"]
-        U4["4 MiB x 3 并发分片下载并合成 Blob"]
+        U4["1.5 MiB x 2 并发分片下载并合成 Blob"]
         U1 --> U2 --> U3
     end
 
@@ -58,7 +58,7 @@ flowchart TD
 | **3. 调度与安全隔离** | Worker → GitHub Actions (`windows-2022`) | GitHub REST API (`workflow_dispatch`)、WebCrypto 原生 AWS SigV4 预签名、Claim 隔离架构 | 仅传入无意义的随机 UUID `job_id` 启动虚拟机（公开运行日志零敏感信息暴露）；Runner 持密钥调 `/claim` 领取 10 分钟有效源码读链接与 30 分钟有效成品回传链接，下载输入包后立即回调 `/downloaded` 秒删 R2 中的源码文件 |
 | **4. 云端安全编译** | Runner 内存 → Windows x64 安装包 | PowerShell 安全解压（防 Zip Slip 路径穿越）、编码探测转码、防 INI 注入、Inno Setup 6 (`ISCC.exe`) | 严检 `mainExe` 合法性；自动识别 ANSI/GB18030/UTF-8 编码的 `license.txt` 并统一规范为 **UTF-16 LE BOM + CRLF**（消除英文构建机中文乱码）；按应用名派生确定性 GUID `AppId`；生成 `x64compatible` 安装脚本并调用 `ISCC.exe` 以 `lzma2/normal` 高压缩编译安装包 |
 | **5. 成品回传与热缓存** | Runner → R2 (`artifacts/`) & Actions Artifact | `.NET ZipFile`（`CompressionLevel.NoCompression`）、S3 V4 Presigned `PUT`、Actions Artifact 冷备 | 将编译产物以纯存储模式封装进 `.zip`（避免浏览器拦截未签名 `.exe` 且无额外压缩耗时），直接走海外高速内网传回 Cloudflare R2 暂存 **1 小时**，同时上传 1 份保留 **1 天**的 GitHub Actions Artifact 作为冷备，最后回调 `/complete` 校验入库 |
-| **6. 分片下载与焚毁** | R2 / GitHub → Worker → 浏览器合成保存 | Query `?start=&end=` 零预检分片、HTTP `206 Partial Content`、`ReadableStream` + `Blob` 合并、Cron 定时巡检 | 前端先查 `?meta=1` 获取字节长度，随后按 **`4 MiB × 3` 并发 + 单片 45 秒超时重连（最多重试 3 次）** 拉取分片：1 小时内直读 R2 边缘节点（绕开 GitHub API 与 60 秒 Azure 临时链），超 1 小时自动回落到 GitHub Artifact 分片转发；每 15 分钟 Cron 自动清除过期源码与超过 1 小时的 R2 成品缓存 |
+| **6. 分片下载与焚毁** | R2 / GitHub → Worker → 浏览器合成保存 | Query `?start=&end=` 零预检分片、HTTP `206 Partial Content`、`ReadableStream` + `Blob` 合并、心跳超时与单路降级、Cron 定时巡检 | 前端先查 `?meta=1` 获取字节长度，随后按 **`1.5 MiB × 2` 并发 + `25 秒` 无数据流心跳超时（最多重试 `5` 次，连续抖动自动降为单路）** 拉取分片：1 小时内直读 R2 边缘节点（仅一次 `R2.get`），超 1 小时自动回落到 GitHub Artifact 分片转发；每 15 分钟 Cron 自动清除过期源码与超过 1 小时的 R2 成品缓存 |
 
 ---
 

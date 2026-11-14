@@ -699,6 +699,36 @@ function buildDownloadHeaders(
   return headers;
 }
 
+function buildRangeErrorResponse(
+  status: 400 | 416,
+  totalSize: number,
+  corsOrigin: string | null
+): Response {
+  return new Response(null, {
+    status,
+    headers: {
+      'content-range': `bytes */${totalSize}`,
+      ...(corsOrigin ? { 'access-control-allow-origin': corsOrigin, vary: 'Origin' } : {}),
+    },
+  });
+}
+
+function buildR2DownloadResponse(
+  body: ReadableStream | null,
+  parsedRange: { full: boolean; start: number; end: number; length: number },
+  totalSize: number,
+  downloadFileName: string,
+  corsOrigin: string | null
+): Response {
+  const headers = buildDownloadHeaders(downloadFileName, ARTIFACT_ZIP_CONTENT_TYPE, 'r2', corsOrigin);
+  headers.set('content-length', String(parsedRange.length));
+  if (!parsedRange.full) {
+    headers.set('content-range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
+  }
+  const status = parsedRange.full ? 200 : 206;
+  return new Response(body, { status, headers });
+}
+
 async function serveR2ArtifactDownload(
   request: Request,
   url: URL,
@@ -707,7 +737,7 @@ async function serveR2ArtifactDownload(
   r2Head: R2Object,
   downloadFileName: string,
   corsOrigin: string | null
-): Promise<Response> {
+): Promise<Response | null> {
   const totalSize = r2Head.size;
   if (url.searchParams.get('meta') === '1') {
     return jsonResponse(
@@ -730,24 +760,11 @@ async function serveR2ArtifactDownload(
     totalSize
   );
   if (!parsedRange.ok) {
-    return new Response(null, {
-      status: parsedRange.status,
-      headers: {
-        'content-range': `bytes */${totalSize}`,
-        ...(corsOrigin ? { 'access-control-allow-origin': corsOrigin, vary: 'Origin' } : {}),
-      },
-    });
+    return buildRangeErrorResponse(parsedRange.status, totalSize, corsOrigin);
   }
-
-  const headers = buildDownloadHeaders(downloadFileName, ARTIFACT_ZIP_CONTENT_TYPE, 'r2', corsOrigin);
-  headers.set('content-length', String(parsedRange.length));
-  if (!parsedRange.full) {
-    headers.set('content-range', `bytes ${parsedRange.start}-${parsedRange.end}/${totalSize}`);
-  }
-  const status = parsedRange.full ? 200 : 206;
 
   if (request.method === 'HEAD') {
-    return new Response(null, { status, headers });
+    return buildR2DownloadResponse(null, parsedRange, totalSize, downloadFileName, corsOrigin);
   }
 
   const obj = parsedRange.full
@@ -756,14 +773,10 @@ async function serveR2ArtifactDownload(
         range: { offset: parsedRange.start, length: parsedRange.length },
       });
   if (!obj || !obj.body) {
-    return jsonResponse(
-      { error: 'ARTIFACT_UNAVAILABLE', message: 'R2 临时缓存已被清理或不存在' },
-      410,
-      corsOrigin
-    );
+    return null;
   }
 
-  return new Response(obj.body, { status, headers });
+  return buildR2DownloadResponse(obj.body, parsedRange, totalSize, downloadFileName, corsOrigin);
 }
 
 async function serveGithubArtifactDownload(
@@ -896,9 +909,40 @@ async function handleDownloadArtifact(
 
   const downloadFileName = resolveDownloadZipFileName(job.artifactName, job.metadata?.appName || '');
   const r2Key = job.artifactR2Key || `artifacts/${job.id}.zip`;
-  const r2Head = await env.BUCKET.head(r2Key);
-  if (r2Head && r2Head.size > 0) {
-    return serveR2ArtifactDownload(request, url, env, r2Key, r2Head, downloadFileName, corsOrigin);
+  const isMetaOrHead = url.searchParams.get('meta') === '1' || request.method === 'HEAD';
+
+  // Skip the extra R2 head() roundtrip on chunk GETs when KV already records artifactSize.
+  if (!isMetaOrHead && job.artifactSize && job.artifactSize > 0) {
+    const knownSize = job.artifactSize;
+    const parsedRange = parseByteRange(
+      url.searchParams.get('start'),
+      url.searchParams.get('end'),
+      request.headers.get('range'),
+      knownSize
+    );
+    if (!parsedRange.ok) {
+      return buildRangeErrorResponse(parsedRange.status, knownSize, corsOrigin);
+    }
+
+    const obj = parsedRange.full
+      ? await env.BUCKET.get(r2Key)
+      : await env.BUCKET.get(r2Key, {
+          range: { offset: parsedRange.start, length: parsedRange.length },
+        });
+    if (obj && obj.body) {
+      if (obj.size === knownSize) {
+        return buildR2DownloadResponse(obj.body, parsedRange, obj.size, downloadFileName, corsOrigin);
+      }
+      await obj.body.cancel().catch(() => undefined);
+      const res = await serveR2ArtifactDownload(request, url, env, r2Key, obj, downloadFileName, corsOrigin);
+      if (res) return res;
+    }
+  } else {
+    const r2Head = await env.BUCKET.head(r2Key);
+    if (r2Head && r2Head.size > 0) {
+      const res = await serveR2ArtifactDownload(request, url, env, r2Key, r2Head, downloadFileName, corsOrigin);
+      if (res) return res;
+    }
   }
 
   if (job.artifactId) {
