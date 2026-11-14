@@ -1,13 +1,64 @@
 # TuKuai-EXE
 
-面向 **TuKuai Studio** 的纯免费、零存储留存 Windows x64 安装包云端封装工具。
+面向 **TuKuai Studio** 的纯免费、零存储留存 Windows x64 安装包云端封装系统。用户无需配置任何服务器或本地编译环境，只需在浏览器中拖入已构建好的桌面应用目录，即可安全完成云端打包并高速下载标准 `Setup.exe` 安装包。
 
-用户在浏览器端拖入**已构建好的应用程序目录**（如 PyInstaller / Nuitka / jpackage 输出目录，含主 `.exe`）与可选 `license.txt`：
-1. **本地打包**：浏览器通过本地内置的 `fflate.browser.js`（零海外 CDN 依赖）做选择性轻量归档（已压缩后缀直存 PassThrough，其余 Deflate level 1）；
-2. **分片并发上传（国内直连）**：经 Cloudflare Turnstile 与 Worker **4 GB 容量硬熔断保护**校验后，前端通过 Worker 自定义域名按 `8 MiB × 3 并发`（`<= 8 MiB` 单片直传）流式写入 Cloudflare R2；
-3. **云端领包与秒删源码**：GitHub Actions（Public 仓库 Windows Server 2022 虚拟机）通过安全密钥 `/claim` 领包并获取成品回传签名链接，下载输入包后**立即通知 Worker 秒删 R2 源码包**；
-4. **云端安全编译**：自动识别并转码 `license.txt` 为 UTF-16 LE BOM（防中文乱码）、防 INI 注入校验后生成 `.iss` 脚本，调用 `ISCC.exe` 编译 `x64compatible` 安装包；
-5. **成品双通道回传与分片极速下载**：Runner 将 `.exe` 以零重压 Store 模式打成 `.zip` 直接传回 R2 缓存 **1 小时**（Cron 自动清理），同时保留 1 天过期 Actions Artifact 作为冷备；前端按 **`4 MiB × 3 并发 + 自动重试`** 从 Worker 拉取合并保存（超 1 小时自动无缝切回 GitHub Artifact 通道）。
+---
+
+## 全链路架构与数据流转图
+
+```mermaid
+flowchart TD
+    subgraph Client["1. 用户浏览器 (前端交互与本地归档)"]
+        U1["拖入应用目录与可选 license.txt"]
+        U2["fflate.browser.js 本地选择性打包 (<= 1 GiB)"]
+        U3["8 MiB x 3 并发简单 POST 分片上传"]
+        U4["4 MiB x 3 并发分片下载并合成 Blob"]
+        U1 --> U2 --> U3
+    end
+
+    subgraph CF["2. Cloudflare 边缘控制与临时存储层"]
+        W["Cloudflare Worker 网关 (自定义域名直连)"]
+        KV[("Workers KV (任务状态 / 频控 / 容量账本)")]
+        R2_IN[("Cloudflare R2 (uploads/ 源码暂存)")]
+        R2_OUT[("Cloudflare R2 (artifacts/ 成品热缓存)")]
+        CRON["Cron 定时清理 (每 15 分钟)"]
+        W <--> KV
+        W -->|"流式写入分片 / 合片"| R2_IN
+        CRON -->|"超 30 分钟删 uploads / 超 1 小时删 artifacts"| R2_IN
+        CRON --> R2_OUT
+    end
+
+    subgraph GH["3. GitHub Actions 云端封装层 (Public 隔离环境)"]
+        ACT["windows-2022 虚拟机 (仅接收随机 job_id)"]
+        INNO["PowerShell 校验转码 + Inno Setup ISCC.exe 编译"]
+        ART[("Actions Artifact (24 小时冷备)")]
+        ACT --> INNO
+    end
+
+    U3 -->|"Turnstile 人机校验 + 免预检上传"| W
+    W -->|"4 GiB 熔断校验后触发 workflow_dispatch"| ACT
+    ACT -->|"携带 RUNNER_AUTH_SECRET 调 /claim 领双 S3 钥匙"| W
+    R2_IN -->|"WebCrypto AWS SigV4 预签名直读"| ACT
+    ACT -->|"拉包后立即回调 /downloaded 秒删源码"| W
+    INNO -->|"Store ZIP 通过预签名 PUT 回传"| R2_OUT
+    INNO -.->|"保留 1 天备份"| ART
+    W -->|"1 小时内优先 206 Range 直读 R2"| R2_OUT
+    W -.->|"超 1 小时自动回落 GitHub 代理"| ART
+    W -->|"GET ?start=&end= 并发返回"| U4
+```
+
+---
+
+## 分阶段流程与核心技术栈
+
+| 阶段 | 数据流向（从哪到哪） | 采用的核心专业技术 | 具体完成的工作 |
+| :--- | :--- | :--- | :--- |
+| **1. 浏览器打包** | 本地文件夹 → 浏览器内存归档包 | `FileSystemDirectoryEntry` 递归遍历、本地内置 `fflate@0.8.2` ESM | 兼容多级目录完整读取（循环读取规避浏览器 100 条截断），对 `.zip/.7z/.png/.asar` 等不可再压缩格式走 `ZipPassThrough` 零重压直存，其余文件走 `ZipDeflate (level: 1)` 轻量压缩，不依赖海外 CDN |
+| **2. 鉴权与分片上传** | 浏览器 → Cloudflare Worker → R2 (`uploads/`) | Cloudflare Turnstile、Workers KV 状态机、CORS 简单请求、`text/plain` POST、R2 Multipart Upload、容量硬熔断 | 验证人机校验令牌与限流额度（单 IP 5 次/小时、全站 120 次/天）；按 **R2 实时已用 + 5 分钟预约占用 ≤ 4 GiB** 执行容量闸门防护；小于等于 `8 MiB` 单片上传，大于 `8 MiB` 切片并发（`8 MiB × 3`、自动重试 3 次）经自定义域名由 Worker 流式写入 R2 |
+| **3. 调度与安全隔离** | Worker → GitHub Actions (`windows-2022`) | GitHub REST API (`workflow_dispatch`)、WebCrypto 原生 AWS SigV4 预签名、Claim 隔离架构 | 仅传入无意义的随机 UUID `job_id` 启动虚拟机（公开运行日志零敏感信息暴露）；Runner 持密钥调 `/claim` 领取 10 分钟有效源码读链接与 30 分钟有效成品回传链接，下载输入包后立即回调 `/downloaded` 秒删 R2 中的源码文件 |
+| **4. 云端安全编译** | Runner 内存 → Windows x64 安装包 | PowerShell 安全解压（防 Zip Slip 路径穿越）、编码探测转码、防 INI 注入、Inno Setup 6 (`ISCC.exe`) | 严检 `mainExe` 合法性；自动识别 ANSI/GB18030/UTF-8 编码的 `license.txt` 并统一规范为 **UTF-16 LE BOM + CRLF**（消除英文构建机中文乱码）；按应用名派生确定性 GUID `AppId`；生成 `x64compatible` 安装脚本并调用 `ISCC.exe` 以 `lzma2/normal` 高压缩编译安装包 |
+| **5. 成品回传与热缓存** | Runner → R2 (`artifacts/`) & Actions Artifact | `.NET ZipFile`（`CompressionLevel.NoCompression`）、S3 V4 Presigned `PUT`、Actions Artifact 冷备 | 将编译产物以纯存储模式封装进 `.zip`（避免浏览器拦截未签名 `.exe` 且无额外压缩耗时），直接走海外高速内网传回 Cloudflare R2 暂存 **1 小时**，同时上传 1 份保留 **1 天**的 GitHub Actions Artifact 作为冷备，最后回调 `/complete` 校验入库 |
+| **6. 分片下载与焚毁** | R2 / GitHub → Worker → 浏览器合成保存 | Query `?start=&end=` 零预检分片、HTTP `206 Partial Content`、`ReadableStream` + `Blob` 合并、Cron 定时巡检 | 前端先查 `?meta=1` 获取字节长度，随后按 **`4 MiB × 3` 并发 + 单片 45 秒超时重连（最多重试 3 次）** 拉取分片：1 小时内直读 R2 边缘节点（绕开 GitHub API 与 60 秒 Azure 临时链），超 1 小时自动回落到 GitHub Artifact 分片转发；每 15 分钟 Cron 自动清除过期源码与超过 1 小时的 R2 成品缓存 |
 
 ---
 
@@ -15,77 +66,18 @@
 
 ```text
 TuKuai-EXE/
-├── .github/workflows/build-installer.yml   # GitHub Actions 云端封装、R2 成品回存与冷备流水线
-├── scripts/build-installer.ps1             # 安全解压、UTF-16 BOM 转码、.iss 生成与 ISCC 编译脚本
-├── worker/                                 # Cloudflare Worker 调度、分片代理、4 GB 熔断与定时清理后端
-│   ├── src/
-│   │   ├── index.ts
-│   │   ├── sigv4.ts                        # 零依赖 WebCrypto R2 SigV4 预签名器
-│   │   ├── validation.ts
-│   │   └── types.ts
-│   ├── test/core.test.mjs
-│   ├── wrangler.toml
-│   └── package.json
-└── web/
-    ├── TuKuaiEXE.html                      # 分片并发上传/下载前端（可独立运行或嵌入 TuKuai-Studio）
-    ├── fflate.browser.js                   # 本地托管的 fflate@0.8.2 ESM 模块
-    └── index.html
-```
-
----
-
-## 部署步骤
-
-### 1. 确保 GitHub 仓库配置完整
-1. 在 GitHub 上将 `TuKuai-EXE` 仓库设为 **Public**（享受无限免费 Windows Actions 时长及 Artifact 存储）。
-2. 在仓库 `Settings -> Secrets and variables -> Actions` 添加 2 个 Repository Secrets：
-   * `RUNNER_AUTH_SECRET`：自己随机生成的长密钥（例如 32 位以上随机字符串），与 Worker 侧一致。
-   * `WORKER_BASE_URL`：你部署后的 Cloudflare Worker 域名（建议绑定自定义域名以优化国内直连，例如 `https://exe.example.com`，末尾不要斜杠）。
-
-### 2. 部署 Cloudflare Worker
-进入 `worker/` 目录安装依赖并创建 KV Namespace：
-
-```bash
-cd worker
-npm install
-npx wrangler login
-npx wrangler kv namespace create JOBS_KV
-```
-
-把命令输出的 KV `id` 填入 `worker/wrangler.toml` 的 `[[kv_namespaces]]` 中，然后部署（推荐在 Cloudflare Dashboard 的 Worker → `Domains` 绑定自己的自定义域名）：
-
-```bash
-npm run deploy
-```
-
-接着依次写入 5 个机密变量（在终端按提示粘贴即可，**切勿写入源码**）：
-
-```bash
-npx wrangler secret put R2_ACCESS_KEY_ID
-npx wrangler secret put R2_SECRET_ACCESS_KEY
-npx wrangler secret put GITHUB_PAT
-npx wrangler secret put TURNSTILE_SECRET_KEY
-npx wrangler secret put RUNNER_AUTH_SECRET
-```
-
-### 3. 嵌入到 TuKuai-Studio
-1. 将 `web/TuKuaiEXE.html` 与 `web/fflate.browser.js` 一并复制到 `TuKuai-Studio/TuKuaiEXE/`，并把 HTML 顶部 `TUKUAI_EXE_CONFIG.apiBase` 改为你的 Worker 域名。
-2. 若绑定了额外访问域名，同步更新 `worker/wrangler.toml` 的 `ALLOWED_ORIGINS`（改完需重新执行 `npm run deploy`）以及 Turnstile 站点 Hostnames 白名单。
-3. 在 `TuKuai-Studio/sections.json` 的 `Sys`（`id: "red"`）板块中挂载 `TuKuaiEXE/TuKuaiEXE.html` 即可。
-
----
-
-## 本地测试
-
-```bash
-cd worker
-npm run typecheck
-npm test
-```
-
-本地启动 Worker + 静态前端测试页：
-
-```bash
-cd worker
-npx wrangler dev
+├── .github/workflows/build-installer.yml   # GitHub Actions 流水线（领包、秒删源码、编译、R2 回传与冷备）
+├── scripts/build-installer.ps1             # 安全解压、UTF-16 BOM 转码、防注入 .iss 生成与 ISCC 编译脚本
+├── web/
+│   ├── TuKuaiEXE.html                      # 浏览器端核心页（目录读取、打包、分片并发上传/下载与主题联动）
+│   ├── fflate.browser.js                   # 本地托管的 fflate@0.8.2 模块（免海外 CDN 访问）
+│   └── index.html                          # 入口跳转页
+└── worker/
+    ├── wrangler.toml                       # Worker 路由、R2/KV 绑定、额度阈值与 15 分钟 Cron 配置
+    ├── test/core.test.mjs                  # 核心校验、Range 解析、SigV4 与双 TTL 过期单元测试
+    └── src/
+        ├── index.ts                        # HTTP 路由网关、4 GiB 熔断、分片代理、Runner 内部接口与清理任务
+        ├── sigv4.ts                        # 零依赖 WebCrypto AWS SigV4 预签名 URL 生成器
+        ├── validation.ts                   # 元数据/分片校验、Byte Range 解析与恒定时间密钥比对
+        └── types.ts                        # 任务与环境变量 TypeScript 类型定义
 ```
