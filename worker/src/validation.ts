@@ -86,3 +86,49 @@ export function safeEqual(a: string, b: string): boolean {
   }
   return diff === 0;
 }
+
+/**
+ * Validates client-supplied multipart part records before completing an R2
+ * multipart upload, ensuring complete part coverage 1..expectedParts.
+ */
+export function validateUploadedParts(
+  rawParts: unknown,
+  expectedParts: number
+): { ok: true; parts: Array<{ partNumber: number; etag: string }> } | { ok: false; error: string } {
+  if (!Array.isArray(rawParts) || rawParts.length !== expectedParts || expectedParts <= 0) {
+    return { ok: false, error: `分片列表不完整，预期 ${expectedParts} 片` };
+  }
+
+  const byPart = new Map<number, string>();
+  for (const item of rawParts) {
+    if (!item || typeof item !== 'object') {
+      return { ok: false, error: '分片记录格式错误' };
+    }
+    const obj = item as Record<string, unknown>;
+    const partNumber = Number(obj.partNumber);
+    const etag = typeof obj.etag === 'string' ? obj.etag.trim() : '';
+    if (
+      !Number.isInteger(partNumber) ||
+      partNumber < 1 ||
+      partNumber > expectedParts ||
+      !etag ||
+      etag.length > 128
+    ) {
+      return { ok: false, error: '分片编号或校验标识无效' };
+    }
+    if (byPart.has(partNumber)) {
+      return { ok: false, error: `分片编号重复: ${partNumber}` };
+    }
+    byPart.set(partNumber, etag);
+  }
+
+  if (byPart.size !== expectedParts) {
+    return { ok: false, error: '存在缺失的上传分片' };
+  }
+
+  const sorted: Array<{ partNumber: number; etag: string }> = [];
+  for (let i = 1; i <= expectedParts; i++) {
+    sorted.push({ partNumber: i, etag: byPart.get(i)! });
+  }
+  return { ok: true, parts: sorted };
+}

@@ -20,6 +20,10 @@ export interface JobRecord {
   r2Key: string;
   declaredSize: number;
   actualSize?: number;
+  uploadMode?: 'single' | 'multipart';
+  uploadId?: string;
+  partSize?: number;
+  expectedParts?: number;
   r2Deleted: boolean;
   status: JobStatus;
   metadata: BuildMetadata;
@@ -29,6 +33,12 @@ export interface JobRecord {
   artifactId?: string;
   artifactName?: string;
   errorMessage?: string;
+}
+
+export interface MultipartTrackerRecord {
+  r2Key: string;
+  uploadId: string;
+  createdAt: number;
 }
 
 export interface ReservationRecord {

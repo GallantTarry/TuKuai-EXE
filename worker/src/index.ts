@@ -1,19 +1,69 @@
 import { presignR2Url } from './sigv4.ts';
-import type { Env, JobRecord, ReservationRecord } from './types.ts';
+import type { Env, JobRecord, MultipartTrackerRecord, ReservationRecord } from './types.ts';
 import {
   isValidUuid,
   parsePositiveInt,
   resolveAllowedOrigin,
   safeEqual,
   validateBuildMetadata,
+  validateUploadedParts,
 } from './validation.ts';
 
 const RESERVATION_PREFIX = 'res:';
 const JOB_PREFIX = 'job:';
+const MPU_PREFIX = 'mpu:';
 const RESERVATION_TTL_SEC = 360;
+const MPU_TTL_SEC = 3600;
 const JOB_TTL_SEC = 86400;
 const ORPHAN_MAX_AGE_MS = 30 * 60 * 1000;
 const PUT_CONTENT_TYPE = 'application/octet-stream';
+// 8 MiB satisfies R2's 5 MiB minimum part rule while staying well under Cloudflare Free's 100 MB limit.
+const UPLOAD_PART_BYTES = 8 * 1024 * 1024;
+
+class BodyLimitError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+async function writeR2FromRequest<T>(
+  request: Request,
+  maxBytes: number,
+  writer: (payload: ReadableStream | ArrayBuffer) => Promise<T>
+): Promise<T> {
+  if (!request.body) {
+    throw new BodyLimitError(400, '请求体为空，未收到上传数据');
+  }
+
+  const lenHeader = request.headers.get('content-length');
+  if (lenHeader !== null) {
+    const declaredLen = Number(lenHeader);
+    if (!Number.isInteger(declaredLen) || declaredLen <= 0 || declaredLen > maxBytes) {
+      throw new BodyLimitError(413, '上传数据块大小超出允许范围');
+    }
+    try {
+      return await writer(request.body);
+    } catch (err) {
+      if (err instanceof TypeError && !request.bodyUsed) {
+        const buf = await request.arrayBuffer();
+        if (buf.byteLength <= 0 || buf.byteLength > maxBytes) {
+          throw new BodyLimitError(413, '上传数据块大小超出允许范围');
+        }
+        return await writer(buf);
+      }
+      throw err;
+    }
+  }
+
+  const buf = await request.arrayBuffer();
+  if (buf.byteLength <= 0 || buf.byteLength > maxBytes) {
+    throw new BodyLimitError(413, '上传数据块大小超出允许范围');
+  }
+  return await writer(buf);
+}
 
 function jsonResponse(
   body: unknown,
@@ -39,7 +89,7 @@ function handleCorsPreflight(corsOrigin: string | null): Response {
     status: 204,
     headers: {
       'access-control-allow-origin': corsOrigin,
-      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-methods': 'GET, POST, PUT, OPTIONS',
       'access-control-allow-headers': 'content-type',
       'access-control-max-age': '86400',
       'vary': 'Origin',
@@ -315,25 +365,37 @@ async function handleCreateJob(
   const jobId = crypto.randomUUID();
   const jobSecret = crypto.randomUUID();
   const r2Key = `uploads/${jobId}.zip`;
-
-  const uploadUrl = await presignR2Url({
-    method: 'PUT',
-    accountId: env.R2_ACCOUNT_ID,
-    bucket: env.R2_BUCKET_NAME,
-    key: r2Key,
-    accessKeyId: env.R2_ACCESS_KEY_ID,
-    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-    expiresSeconds: 300,
-    contentType: PUT_CONTENT_TYPE,
-  });
-
   const now = Date.now();
+
+  const uploadMode = declaredSize <= UPLOAD_PART_BYTES ? 'single' : 'multipart';
+  const expectedParts = uploadMode === 'single' ? 1 : Math.ceil(declaredSize / UPLOAD_PART_BYTES);
+
+  let uploadId: string | undefined;
+  const kvWrites: Array<Promise<void>> = [];
+
+  if (uploadMode === 'multipart') {
+    const mpu = await env.BUCKET.createMultipartUpload(r2Key, {
+      httpMetadata: { contentType: PUT_CONTENT_TYPE },
+    });
+    uploadId = mpu.uploadId;
+    const tracker: MultipartTrackerRecord = { r2Key, uploadId, createdAt: now };
+    kvWrites.push(
+      env.JOBS_KV.put(`${MPU_PREFIX}${jobId}`, JSON.stringify(tracker), {
+        expirationTtl: MPU_TTL_SEC,
+      })
+    );
+  }
+
   const reservation: ReservationRecord = { bytes: declaredSize, createdAt: now };
   const job: JobRecord = {
     id: jobId,
     jobSecret,
     r2Key,
     declaredSize,
+    uploadMode,
+    uploadId,
+    partSize: UPLOAD_PART_BYTES,
+    expectedParts,
     r2Deleted: false,
     status: 'awaiting_upload',
     metadata: metaCheck.value,
@@ -341,18 +403,21 @@ async function handleCreateJob(
     updatedAt: now,
   };
 
-  await Promise.all([
+  kvWrites.push(
     env.JOBS_KV.put(`${RESERVATION_PREFIX}${jobId}`, JSON.stringify(reservation), {
       expirationTtl: RESERVATION_TTL_SEC,
     }),
-    putJob(env, job),
-  ]);
+    putJob(env, job)
+  );
+  await Promise.all(kvWrites);
 
   return jsonResponse(
     {
       jobId,
       jobSecret,
-      uploadUrl,
+      uploadMode,
+      partSize: UPLOAD_PART_BYTES,
+      totalParts: expectedParts,
       contentType: PUT_CONTENT_TYPE,
       expiresIn: 300,
     },
@@ -361,15 +426,114 @@ async function handleCreateJob(
   );
 }
 
+async function authorizeAwaitingUpload(
+  env: Env,
+  jobId: string,
+  secret: string,
+  corsOrigin: string | null
+): Promise<{ ok: true; job: JobRecord } | { ok: false; response: Response }> {
+  const job = await getJob(env, jobId);
+  if (!job || !secret || !safeEqual(secret, job.jobSecret)) {
+    return {
+      ok: false,
+      response: jsonResponse({ error: 'NOT_FOUND', message: '任务不存在或凭证无效' }, 404, corsOrigin),
+    };
+  }
+  if (job.status !== 'awaiting_upload') {
+    return {
+      ok: false,
+      response: jsonResponse({ error: 'INVALID_STATE', message: '当前任务状态不允许上传' }, 409, corsOrigin),
+    };
+  }
+  return { ok: true, job };
+}
+
+async function handleDirectUpload(
+  request: Request,
+  url: URL,
+  env: Env,
+  jobId: string,
+  corsOrigin: string | null
+): Promise<Response> {
+  const secret = url.searchParams.get('secret') || '';
+  const auth = await authorizeAwaitingUpload(env, jobId, secret, corsOrigin);
+  if (!auth.ok) return auth.response;
+
+  const { job } = auth;
+  if (job.uploadMode && job.uploadMode !== 'single') {
+    return jsonResponse({ error: 'UPLOAD_MODE_MISMATCH', message: '该任务需分片上传' }, 400, corsOrigin);
+  }
+
+  const maxPkgBytes = parsePositiveInt(env.MAX_PACKAGE_BYTES, 1024 * 1024 * 1024);
+  const maxSingleBytes = Math.min(maxPkgBytes, UPLOAD_PART_BYTES, job.declaredSize + 1024 * 1024);
+
+  try {
+    const obj = await writeR2FromRequest(request, maxSingleBytes, (payload) =>
+      env.BUCKET.put(job.r2Key, payload, {
+        httpMetadata: { contentType: PUT_CONTENT_TYPE },
+      })
+    );
+    return jsonResponse({ uploaded: true, size: obj.size }, 200, corsOrigin);
+  } catch (err) {
+    if (err instanceof BodyLimitError) {
+      return jsonResponse({ error: 'UPLOAD_REJECTED', message: err.message }, err.status, corsOrigin);
+    }
+    return jsonResponse({ error: 'UPLOAD_FAILED', message: '写入临时存储失败，请重试' }, 502, corsOrigin);
+  }
+}
+
+async function handleUploadPart(
+  request: Request,
+  url: URL,
+  env: Env,
+  jobId: string,
+  partNumberRaw: string,
+  corsOrigin: string | null
+): Promise<Response> {
+  const secret = url.searchParams.get('secret') || '';
+  const auth = await authorizeAwaitingUpload(env, jobId, secret, corsOrigin);
+  if (!auth.ok) return auth.response;
+
+  const { job } = auth;
+  if (job.uploadMode !== 'multipart' || !job.uploadId) {
+    return jsonResponse({ error: 'UPLOAD_MODE_MISMATCH', message: '任务未启用分片上传' }, 400, corsOrigin);
+  }
+
+  const expectedParts = job.expectedParts || 1;
+  const partNumber = Number(partNumberRaw);
+  if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > expectedParts) {
+    return jsonResponse({ error: 'INVALID_PART', message: '无效的分片编号' }, 400, corsOrigin);
+  }
+
+  const maxPartBytes = job.partSize || UPLOAD_PART_BYTES;
+  const mpu = env.BUCKET.resumeMultipartUpload(job.r2Key, job.uploadId);
+
+  try {
+    const uploaded = await writeR2FromRequest(request, maxPartBytes, (payload) =>
+      mpu.uploadPart(partNumber, payload)
+    );
+    return jsonResponse(
+      { partNumber: uploaded.partNumber, etag: uploaded.etag },
+      200,
+      corsOrigin
+    );
+  } catch (err) {
+    if (err instanceof BodyLimitError) {
+      return jsonResponse({ error: 'UPLOAD_REJECTED', message: err.message }, err.status, corsOrigin);
+    }
+    return jsonResponse({ error: 'PART_UPLOAD_FAILED', message: '分片写入失败，正在重试' }, 502, corsOrigin);
+  }
+}
+
 async function handleStartJob(
   request: Request,
   env: Env,
   jobId: string,
   corsOrigin: string | null
 ): Promise<Response> {
-  let body: { secret?: string };
+  let body: { secret?: string; parts?: unknown };
   try {
-    body = (await request.json()) as { secret?: string };
+    body = (await request.json()) as { secret?: string; parts?: unknown };
   } catch {
     return jsonResponse({ error: 'BAD_JSON', message: '请求格式错误' }, 400, corsOrigin);
   }
@@ -381,6 +545,29 @@ async function handleStartJob(
 
   if (job.status !== 'awaiting_upload') {
     return jsonResponse({ status: job.status, runId: job.runId }, 200, corsOrigin);
+  }
+
+  if (job.uploadMode === 'multipart' && job.uploadId) {
+    const partsCheck = validateUploadedParts(body.parts, job.expectedParts || 1);
+    if (!partsCheck.ok) {
+      return jsonResponse({ error: 'PARTS_INCOMPLETE', message: partsCheck.error }, 400, corsOrigin);
+    }
+    const mpu = env.BUCKET.resumeMultipartUpload(job.r2Key, job.uploadId);
+    try {
+      await mpu.complete(partsCheck.parts);
+    } catch {
+      try { await mpu.abort(); } catch {}
+      await Promise.all([
+        env.JOBS_KV.delete(`${RESERVATION_PREFIX}${jobId}`),
+        env.JOBS_KV.delete(`${MPU_PREFIX}${jobId}`),
+      ]);
+      job.r2Deleted = true;
+      job.status = 'failed';
+      job.errorMessage = '云端合并上传分片失败，请重新上传';
+      await putJob(env, job);
+      return jsonResponse({ error: 'MULTIPART_COMPLETE_FAILED', message: job.errorMessage }, 400, corsOrigin);
+    }
+    await env.JOBS_KV.delete(`${MPU_PREFIX}${jobId}`);
   }
 
   const maxPkgBytes = parsePositiveInt(env.MAX_PACKAGE_BYTES, 1024 * 1024 * 1024);
@@ -451,6 +638,7 @@ async function handleGetJobStatus(
 }
 
 async function handleDownloadArtifact(
+  request: Request,
   url: URL,
   env: Env,
   jobId: string,
@@ -474,7 +662,15 @@ async function handleDownloadArtifact(
   });
 
   const location = ghRes.headers.get('location');
-  if (ghRes.status >= 300 && ghRes.status < 400 && location) {
+  if (ghRes.status < 300 || ghRes.status >= 400 || !location) {
+    return jsonResponse(
+      { error: 'ARTIFACT_UNAVAILABLE', message: '安装包直链已过期或不存在' },
+      410,
+      corsOrigin
+    );
+  }
+
+  if (url.searchParams.get('direct') === '1') {
     return new Response(null, {
       status: 302,
       headers: {
@@ -485,11 +681,48 @@ async function handleDownloadArtifact(
     });
   }
 
-  return jsonResponse(
-    { error: 'ARTIFACT_UNAVAILABLE', message: '安装包直链已过期或不存在' },
-    410,
-    corsOrigin
+  const upstreamHeaders: Record<string, string> = {};
+  const range = request.headers.get('range');
+  const ifRange = request.headers.get('if-range');
+  if (range) upstreamHeaders['range'] = range;
+  if (ifRange) upstreamHeaders['if-range'] = ifRange;
+
+  const upstreamRes = await fetch(location, { headers: upstreamHeaders });
+  if (!upstreamRes.ok && upstreamRes.status !== 206) {
+    return jsonResponse(
+      { error: 'ARTIFACT_FETCH_FAILED', message: '拉取安装包成品失败，请稍后重试' },
+      502,
+      corsOrigin
+    );
+  }
+
+  const baseName = (job.artifactName || 'TuKuai-Setup-x64')
+    .replace(/\.exe$/i, '')
+    .replace(/\.zip$/i, '')
+    .replace(/["\\\r\n]/g, '_') || 'TuKuai-Setup-x64';
+  const downloadFileName = `${baseName}.zip`;
+  const asciiName = downloadFileName.replace(/[^\x20-\x7E]/g, '_') || 'TuKuai-Setup-x64.zip';
+
+  const resHeaders = new Headers();
+  resHeaders.set('content-type', upstreamRes.headers.get('content-type') || 'application/zip');
+  resHeaders.set('cache-control', 'no-store');
+  resHeaders.set(
+    'content-disposition',
+    `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(downloadFileName)}`
   );
+  for (const h of ['content-length', 'content-range', 'accept-ranges', 'etag']) {
+    const val = upstreamRes.headers.get(h);
+    if (val) resHeaders.set(h, val);
+  }
+  if (corsOrigin) {
+    resHeaders.set('access-control-allow-origin', corsOrigin);
+    resHeaders.set('vary', 'Origin');
+  }
+
+  return new Response(upstreamRes.body, {
+    status: upstreamRes.status,
+    headers: resHeaders,
+  });
 }
 
 async function handleInternalClaim(request: Request, env: Env, jobId: string): Promise<Response> {
@@ -594,6 +827,32 @@ async function cleanupOrphanR2Objects(env: Env): Promise<number> {
     cursor = listed.truncated ? listed.cursor : undefined;
   } while (cursor);
 
+  // Also abort stale uncommitted multipart uploads so abandoned parts do not linger in R2.
+  let mpuCursor: string | undefined;
+  do {
+    const kvList = await env.JOBS_KV.list({ prefix: MPU_PREFIX, cursor: mpuCursor });
+    const records = await Promise.all(
+      kvList.keys.map(async (item) => ({
+        key: item.name,
+        rec: await env.JOBS_KV.get<MultipartTrackerRecord>(item.name, 'json'),
+      }))
+    );
+    for (const { key, rec } of records) {
+      if (!rec || rec.createdAt < cutoff) {
+        if (rec?.r2Key && rec?.uploadId) {
+          try {
+            await env.BUCKET.resumeMultipartUpload(rec.r2Key, rec.uploadId).abort();
+            deletedCount++;
+          } catch {
+            // Ignore already completed or aborted multipart uploads.
+          }
+        }
+        await env.JOBS_KV.delete(key);
+      }
+    }
+    mpuCursor = kvList.list_complete ? undefined : kvList.cursor;
+  } while (mpuCursor);
+
   return deletedCount;
 }
 
@@ -615,17 +874,25 @@ export default {
       return handleCreateJob(request, env, corsOrigin);
     }
 
-    const jobMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)(?:\/(start|download))?$/);
+    const partMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/parts\/([0-9]+)$/);
+    if (partMatch && isValidUuid(partMatch[1]) && (request.method === 'PUT' || request.method === 'POST')) {
+      return handleUploadPart(request, url, env, partMatch[1], partMatch[2], corsOrigin);
+    }
+
+    const jobMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)(?:\/(upload|start|download))?$/);
     if (jobMatch && isValidUuid(jobMatch[1])) {
       const [, jobId, action] = jobMatch;
       if (!action && request.method === 'GET') {
         return handleGetJobStatus(url, env, jobId, corsOrigin);
       }
+      if (action === 'upload' && (request.method === 'PUT' || request.method === 'POST')) {
+        return handleDirectUpload(request, url, env, jobId, corsOrigin);
+      }
       if (action === 'start' && request.method === 'POST') {
         return handleStartJob(request, env, jobId, corsOrigin);
       }
       if (action === 'download' && request.method === 'GET') {
-        return handleDownloadArtifact(url, env, jobId, corsOrigin);
+        return handleDownloadArtifact(request, url, env, jobId, corsOrigin);
       }
     }
 

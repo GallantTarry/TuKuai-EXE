@@ -6,6 +6,7 @@ import {
   resolveAllowedOrigin,
   safeEqual,
   validateBuildMetadata,
+  validateUploadedParts,
 } from '../src/validation.ts';
 
 test('validateBuildMetadata accepts valid Chinese and ASCII metadata', () => {
@@ -88,4 +89,34 @@ test('presignR2Url produces valid AWS SigV4 presigned query URL', async () => {
   assert.equal(url.searchParams.get('X-Amz-Expires'), '300');
   assert.equal(url.searchParams.get('X-Amz-SignedHeaders'), 'content-type;host');
   assert.match(url.searchParams.get('X-Amz-Signature') || '', /^[0-9a-f]{64}$/);
+});
+
+test('validateUploadedParts validates completeness and sorts parts ascending', () => {
+  const valid = validateUploadedParts(
+    [
+      { partNumber: 2, etag: '"etag-2"' },
+      { partNumber: 1, etag: '"etag-1"' },
+    ],
+    2
+  );
+  assert.equal(valid.ok, true);
+  if (valid.ok) {
+    assert.deepEqual(valid.parts, [
+      { partNumber: 1, etag: '"etag-1"' },
+      { partNumber: 2, etag: '"etag-2"' },
+    ]);
+  }
+
+  assert.equal(validateUploadedParts([{ partNumber: 1, etag: '"e1"' }], 2).ok, false);
+  assert.equal(
+    validateUploadedParts(
+      [
+        { partNumber: 1, etag: '"e1"' },
+        { partNumber: 1, etag: '"e1"' },
+      ],
+      2
+    ).ok,
+    false
+  );
+  assert.equal(validateUploadedParts([{ partNumber: 3, etag: '"e3"' }], 1).ok, false);
 });
