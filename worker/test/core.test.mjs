@@ -170,13 +170,10 @@ test('parseByteRange supports query chunks and HTTP Range headers safely', () =>
   assert.deepEqual(parseByteRange('-1', '10', null, 100), { ok: false, status: 400 });
 });
 
-test('shouldExpireR2Object applies 30m TTL for uploads and 1h TTL for artifacts', () => {
+test('shouldExpireR2Object expires transient R2 objects past 30m TTL', () => {
   const now = 10_000_000;
-  const uploadMax = 30 * 60 * 1000;
-  const artifactMax = 60 * 60 * 1000;
+  const maxAgeMs = 30 * 60 * 1000;
 
-  assert.equal(shouldExpireR2Object('uploads/job-1.zip', now - 31 * 60 * 1000, now, uploadMax, artifactMax), true);
-  assert.equal(shouldExpireR2Object('uploads/job-1.zip', now - 20 * 60 * 1000, now, uploadMax, artifactMax), false);
-  assert.equal(shouldExpireR2Object('artifacts/job-1.zip', now - 45 * 60 * 1000, now, uploadMax, artifactMax), false);
-  assert.equal(shouldExpireR2Object('artifacts/job-1.zip', now - 61 * 60 * 1000, now, uploadMax, artifactMax), true);
+  assert.equal(shouldExpireR2Object(now - 31 * 60 * 1000, now, maxAgeMs), true);
+  assert.equal(shouldExpireR2Object(now - 20 * 60 * 1000, now, maxAgeMs), false);
 });

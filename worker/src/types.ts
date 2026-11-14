@@ -30,8 +30,6 @@ export interface JobRecord {
   createdAt: number;
   updatedAt: number;
   runId?: string;
-  artifactR2Key?: string;
-  artifactSize?: number;
   artifactId?: string;
   artifactName?: string;
   errorMessage?: string;

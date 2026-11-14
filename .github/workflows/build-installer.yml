@@ -69,19 +69,9 @@ jobs:
             Write-Warning "Failed to acknowledge R2 deletion immediately: $($_.Exception.Message)"
           }
 
-          $artifactUrlFile = Join-Path $workDir 'artifact_upload_url.txt'
-          if ($claim.artifactUploadUrl) {
-            [System.IO.File]::WriteAllText(
-              $artifactUrlFile,
-              [string]$claim.artifactUploadUrl,
-              [System.Text.UTF8Encoding]::new($false)
-            )
-          }
-
           "work_dir=$workDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "archive_path=$archivePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "meta_path=$metaPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "artifact_url_file=$artifactUrlFile" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
         id: claim
 
       - name: Generate .iss and compile x64 installer
@@ -95,63 +85,8 @@ jobs:
             -OutputDir $outDir `
             -MetadataJsonPath "${{ steps.claim.outputs.meta_path }}"
 
-      - name: Package installer zip and upload to R2 (1-hour cache)
-        id: r2stage
-        shell: pwsh
-        run: |
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $exePath = "${{ steps.compile.outputs.exe_path }}"
-          $exeName = "${{ steps.compile.outputs.exe_name }}"
-          $urlFile = "${{ steps.claim.outputs.artifact_url_file }}"
-          $outDir = Split-Path -Parent $exePath
-          $zipName = [System.IO.Path]::ChangeExtension($exeName, '.zip')
-          $zipPath = Join-Path $outDir $zipName
-
-          if (Test-Path -LiteralPath $zipPath) {
-            Remove-Item -LiteralPath $zipPath -Force
-          }
-
-          $zipArchive = [System.IO.Compression.ZipFile]::Open($zipPath, 'Create')
-          try {
-            # Inno Setup output is already LZMA2-compressed; store mode avoids wasted CPU.
-            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-              $zipArchive,
-              $exePath,
-              $exeName,
-              [System.IO.Compression.CompressionLevel]::NoCompression
-            ) | Out-Null
-          } finally {
-            $zipArchive.Dispose()
-          }
-
-          $zipSize = (Get-Item -LiteralPath $zipPath).Length
-          $uploaded = 'false'
-          try {
-            if ($urlFile -and (Test-Path -LiteralPath $urlFile -PathType Leaf)) {
-              $uploadUrl = ([System.IO.File]::ReadAllText($urlFile, [System.Text.Encoding]::UTF8)).Trim()
-              if (-not [string]::IsNullOrWhiteSpace($uploadUrl)) {
-                & curl.exe -sSfL --retry 3 --retry-delay 2 -X PUT -H "Content-Type: application/zip" -T $zipPath $uploadUrl
-                if ($LASTEXITCODE -eq 0) {
-                  $uploaded = 'true'
-                  Write-Host "Staged installer zip in R2 ($zipSize bytes)."
-                } else {
-                  Write-Warning "Failed to upload staged zip to R2 (exit $LASTEXITCODE); relying on Actions Artifact fallback."
-                }
-              }
-            }
-          } finally {
-            if ($urlFile -and (Test-Path -LiteralPath $urlFile -PathType Leaf)) {
-              Remove-Item -LiteralPath $urlFile -Force -ErrorAction SilentlyContinue
-            }
-          }
-
-          "zip_name=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "zip_size=$zipSize" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "r2_uploaded=$uploaded" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      - name: Upload installer artifact (1-day backup retention)
+      - name: Upload installer artifact (1-day retention)
         id: upload
-        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: installer-${{ inputs.job_id }}
@@ -166,32 +101,25 @@ jobs:
           JOB_OUTCOME: ${{ job.status }}
           ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           EXE_NAME: ${{ steps.compile.outputs.exe_name }}
-          ZIP_NAME: ${{ steps.r2stage.outputs.zip_name }}
-          R2_UPLOADED: ${{ steps.r2stage.outputs.r2_uploaded }}
         run: |
           $base = $env:WORKER_BASE_URL.TrimEnd('/')
           $headers = @{
             Authorization  = "Bearer $($env:RUNNER_AUTH_SECRET)"
             'Content-Type' = 'application/json'
           }
-          $r2Ok = ($env:R2_UPLOADED -eq 'true')
-          $ghOk = -not [string]::IsNullOrWhiteSpace($env:ARTIFACT_ID)
-          $ok = ($env:JOB_OUTCOME -eq 'success') -and ($r2Ok -or $ghOk)
-          $preferredName = if (-not [string]::IsNullOrWhiteSpace($env:ZIP_NAME)) {
-            $env:ZIP_NAME
-          } elseif (-not [string]::IsNullOrWhiteSpace($env:EXE_NAME)) {
+          $ok = ($env:JOB_OUTCOME -eq 'success') -and (-not [string]::IsNullOrWhiteSpace($env:ARTIFACT_ID))
+          $preferredName = if (-not [string]::IsNullOrWhiteSpace($env:EXE_NAME)) {
             [System.IO.Path]::ChangeExtension($env:EXE_NAME, '.zip')
           } else {
             'TuKuai-Setup-x64.zip'
           }
 
           $body = @{
-            ok               = $ok
-            runId            = $env:GITHUB_RUN_ID
-            artifactUploaded = $r2Ok
-            artifactId       = $env:ARTIFACT_ID
-            artifactName     = $preferredName
-            errorMessage     = if ($ok) { $null } else { "GitHub Actions build finished with status: $($env:JOB_OUTCOME)" }
+            ok           = $ok
+            runId        = $env:GITHUB_RUN_ID
+            artifactId   = $env:ARTIFACT_ID
+            artifactName = $preferredName
+            errorMessage = if ($ok) { $null } else { "GitHub Actions build finished with status: $($env:JOB_OUTCOME)" }
           } | ConvertTo-Json -Compress
 
           Invoke-RestMethod -Method Post -Uri "$base/api/internal/jobs/$($env:JOB_ID)/complete" -Headers $headers -Body $body | Out-Null

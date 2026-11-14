@@ -216,12 +216,9 @@ export function parseByteRange(
 }
 
 export function shouldExpireR2Object(
-  key: string,
   uploadedMs: number,
   nowMs: number,
-  uploadMaxAgeMs: number,
-  artifactMaxAgeMs: number
+  maxAgeMs: number
 ): boolean {
-  const maxAge = key.startsWith('artifacts/') ? artifactMaxAgeMs : uploadMaxAgeMs;
-  return uploadedMs < nowMs - maxAge;
+  return uploadedMs < nowMs - maxAgeMs;
 }
