@@ -82,8 +82,12 @@ TuKuai-EXE/
 
 ---
 
-## License
+## Copyright & Notice
 
-Copyright © 2026 TuKuai. Licensed under the [Apache License 2.0](LICENSE).
+```text
+Copyright (c) 2026 TuKuai (GallantTarry). All rights reserved.
+```
 
-> Third-party notice: `web/fflate.browser.js` bundles `fflate@0.8.2` (by Arjun Barrett), which is licensed under the MIT License.
+This repository makes its source code publicly visible on GitHub solely for **viewing, learning, and technical reference**. Without prior written permission from the copyright holder, copying, modifying, mirroring/re-hosting, or redistributing the original code, UI design, scripts, or original assets for commercial or non-commercial purposes is prohibited. See [LICENSE](LICENSE) for details.
+
+> Third-party notice: `web/fflate.browser.js` bundles `fflate@0.8.2` (by Arjun Barrett), which is licensed under the MIT License. External development dependencies and CI/build tools remain subject to their respective licenses.

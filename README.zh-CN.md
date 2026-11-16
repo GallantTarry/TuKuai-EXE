@@ -82,8 +82,12 @@ TuKuai-EXE/
 
 ---
 
-## 开源协议
+## 版权与使用声明
 
-Copyright © 2026 TuKuai。本项目采用 [Apache License 2.0](LICENSE) 开源协议。
+```text
+Copyright (c) 2026 TuKuai (GallantTarry). All rights reserved.
+```
 
-> 第三方声明：`web/fflate.browser.js` 内置了 `fflate@0.8.2`（作者 Arjun Barrett），该库采用 MIT License。
+本项目源码在 GitHub 公开仅用于**浏览、学习与技术参考**，**保留所有权利（非开源授权）**。未经版权持有人书面许可，禁止复制、修改、镜像克隆重新部署，或将原创代码、UI 设计、脚本与原创素材用于任何商业或非商业再分发。详见 [LICENSE](LICENSE)。
+
+> 第三方声明：`web/fflate.browser.js` 内置了 `fflate@0.8.2`（作者 Arjun Barrett），该库采用 MIT License；开发依赖与 CI 构建过程中调用的外部工具各自遵循其原始协议。
