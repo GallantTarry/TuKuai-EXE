@@ -79,3 +79,11 @@ TuKuai-EXE/
         ├── validation.ts                   # Metadata/part validation, Byte Range parser, constant-time secret check, and expiration helper
         └── types.ts                        # TypeScript interfaces for job records and Worker environment bindings
 ```
+
+---
+
+## License
+
+Copyright © 2026 TuKuai. Licensed under the [Apache License 2.0](LICENSE).
+
+> Third-party notice: `web/fflate.browser.js` bundles `fflate@0.8.2` (by Arjun Barrett), which is licensed under the MIT License.

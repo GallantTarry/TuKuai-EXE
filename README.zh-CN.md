@@ -79,3 +79,11 @@ TuKuai-EXE/
         ├── validation.ts                   # 元数据/分片校验、Byte Range 解析、常量时间比对与过期判断
         └── types.ts                        # 任务记录与 Worker 环境变量 TypeScript 类型定义
 ```
+
+---
+
+## 开源协议
+
+Copyright © 2026 TuKuai。本项目采用 [Apache License 2.0](LICENSE) 开源协议。
+
+> 第三方声明：`web/fflate.browser.js` 内置了 `fflate@0.8.2`（作者 Arjun Barrett），该库采用 MIT License。
